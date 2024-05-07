@@ -395,6 +395,7 @@ def train(
     learning_rate: Optional[float] = None,
     weight_decay: Optional[float] = None,
     max_epochs: Optional[int] = None,
+    disable_wandb: bool = typer.Option(False, "--disable-wandb", help="Disable Weights & Biases logging."),
 ):
     train_config = {
         "context_len": context_len or config["context_len"],
@@ -425,7 +426,7 @@ def train(
         accelerator="gpu",
         precision="16-mixed",
         callbacks=[RichProgressBar()],
-        logger=WandbLogger(project="pico"),
+        logger=None if disable_wandb else WandbLogger(project="pico"),
         limit_train_batches=0.125,
     )
 
