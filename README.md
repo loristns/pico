@@ -1,2 +1,2 @@
-# XTNS Pico
+# Pico
 Language model implementation. WIP
