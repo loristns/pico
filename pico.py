@@ -181,10 +181,11 @@ class CapacitiveMHA(nn.Module):
         )
 
         # Reorder top_router_indices and top_router_weights in the order of original query_seq
-        top_router_indices, top_router_order = torch.sort(top_router_indices, dim=1)
-        top_router_weights = torch.gather(
-            top_router_weights, dim=1, index=top_router_order
-        )
+        # NOTE: This is not necessary here as we do non-causal attention but I keep it for reference
+        # top_router_indices, top_router_order = torch.sort(top_router_indices, dim=1)
+        # top_router_weights = torch.gather(
+        #     top_router_weights, dim=1, index=top_router_order
+        # )
 
         # Duplicate top_router_indices over each emb_dim for gather/scatter operations
         top_router_indices_exp = einops.repeat(
