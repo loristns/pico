@@ -154,10 +154,8 @@ class CapacitiveMHA(nn.Module):
 
         self.q_proj = nn.Linear(query_seq_dim, self.emb_dim * num_heads, bias=False)
         self.kv_proj = nn.Linear(
-            value_seq_dim, self.emb_dim * num_heads * 3, bias=False
+            value_seq_dim, self.emb_dim * num_heads * 2, bias=False
         )
-
-        self.v_swiglu = SwiGLU()
 
         self.out_proj = nn.Linear(
             self.emb_dim * self.num_heads, query_seq_dim, bias=False
@@ -207,15 +205,7 @@ class CapacitiveMHA(nn.Module):
         # where seq_len is query_capacity for q, and value_seq_len for k and v
         q: torch.Tensor = self.q_proj(resampled_query_seq)
         kv: torch.Tensor = self.kv_proj(value_seq)
-        # v is originally 2x emb_dim because SwiGLU is applied to it before splitting heads
-        k, v = torch.split(
-            kv,
-            [self.emb_dim * self.num_heads, self.emb_dim * self.num_heads * 2],
-            dim=-1,
-        )
-
-        # Apply SwiGLU to v
-        v = self.v_swiglu(v)
+        k, v = kv.chunk(2, dim=-1)
 
         # Split heads so F.scaled_dot_product_attention can be applied separately to each head
         split_heads = (
