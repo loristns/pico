@@ -260,7 +260,7 @@ class SwiGLU(nn.Module):
         return F.silu(gate) * x
 
 
-class ParallelBlock(nn.Module):
+class Block(nn.Module):
     def __init__(
         self,
         query_seq_dim: int,
@@ -310,7 +310,7 @@ class DenoisingModel(L.LightningModule):
 
         self.blocks = nn.ModuleList(
             [
-                ParallelBlock(
+                Block(
                     query_seq_dim=config["dim"],
                     value_seq_dim=config["dim"],
                     num_heads=config["num_heads"],
