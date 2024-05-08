@@ -172,8 +172,7 @@ class CapacitiveMHA(nn.Module):
 
         # Weight most relevant tokens from query_seq
         # (batch_size, query_seq_len, 1)
-        router_weights = self.router(query_seq)
-        router_weights = F.softmax(router_weights, dim=1)
+        router_weights = self.router(query_seq).to(torch.float32)
 
         # Select top-k tokens
         # (batch_size, query_capacity, 1)
@@ -437,6 +436,7 @@ def test(version: str, epoch: int, step: int):
         f"pico/{version}/checkpoints/epoch={epoch}-step={step}.ckpt",
         # query_capacity=128
     )
+    model.eval()
 
     with torch.no_grad():
         dataset = DenoisingDataset(1024, 30)
