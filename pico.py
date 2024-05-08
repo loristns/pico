@@ -3,6 +3,8 @@ from typing import Optional
 
 import einops
 import lightning as L
+import rich
+import rich.box
 import torch
 import torch.nn.functional as F
 import typer
@@ -11,6 +13,7 @@ from lightning.pytorch.callbacks import RichProgressBar
 from lightning.pytorch.loggers import WandbLogger
 from lightning.pytorch.utilities import grad_norm
 from rich.logging import RichHandler
+from rich.table import Table
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -395,20 +398,24 @@ def train(
     learning_rate: Optional[float] = None,
     weight_decay: Optional[float] = None,
     max_epochs: Optional[int] = None,
-    disable_wandb: bool = typer.Option(False, "--disable-wandb", help="Disable Weights & Biases logging."),
+    disable_wandb: bool = typer.Option(
+        False, "--disable-wandb", help="Disable Weights & Biases logging."
+    ),
 ):
     train_config = {
-        "context_len": context_len or config["context_len"],
-        "dim": dim or config["dim"],
-        "num_blocks": num_blocks or config["num_blocks"],
-        "num_heads": num_heads or config["num_heads"],
-        "query_capacity": query_capacity or config["query_capacity"],
-        "batch_size": batch_size or config["batch_size"],
-        "noise_levels": noise_levels or config["noise_levels"],
-        "learning_rate": learning_rate or config["learning_rate"],
-        "weight_decay": weight_decay or config["weight_decay"],
-        "max_epochs": max_epochs or config["max_epochs"],
+        key: value if value is not None else config[key]
+        for key, value in locals().items()
+        if key in config
     }
+
+    # Print config as a table
+    table = Table(title="Training Configuration")
+    table.add_column("Parameter")
+    table.add_column("Value")
+    for key, value in train_config.items():
+        table.add_row(key, str(value))
+
+    rich.print(table)
 
     torch.set_float32_matmul_precision("medium")  # Enable Tensor Cores
 
