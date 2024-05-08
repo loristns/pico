@@ -242,10 +242,11 @@ class CapacitiveMHA(nn.Module):
         )
         att = self.out_proj(att)
 
-        # Finally, we scatter the output back to the original sequence
-        # (batch_size, query_seq_len, query_seq_dim)
-        output = torch.scatter_add(
-            query_seq,
+        # Finally, we create a sparse tensor with the resampled query tokens
+        # at their original positions in the query sequence
+        output = torch.zeros_like(query_seq)
+        output = torch.scatter(
+            output,
             dim=1,
             index=top_router_indices_exp,
             src=att * top_router_weights,
