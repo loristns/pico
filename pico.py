@@ -94,7 +94,6 @@ class DenoisingDataset(Dataset):
 #################################
 #             Model             #
 #################################
-# (Mixture of depth), perceiver IO with GPT-J style parallel block and (ROPE)
 
 
 class RotaryEmbedding(nn.Module):
@@ -280,6 +279,7 @@ class Block(nn.Module):
         self,
         query_seq: torch.Tensor,
         value_seq: torch.Tensor,
+        return_attention: bool = False,
     ) -> torch.Tensor:
         query_seq_norm = self.query_ln(query_seq)
         value_seq_norm = self.value_ln(value_seq)
@@ -287,7 +287,13 @@ class Block(nn.Module):
         att = self.mha(query_seq_norm, value_seq_norm)
         ffn = self.ffn(query_seq_norm)
 
-        return query_seq + att + ffn
+        out = query_seq + att + ffn
+
+        if return_attention:
+            # Return attention output for visualization
+            return out, att
+
+        return out
 
 
 class DenoisingModel(L.LightningModule):
@@ -310,16 +316,31 @@ class DenoisingModel(L.LightningModule):
             ]
         )
 
-    def forward(self, x: torch.Tensor, noise_rate: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        noise_rate: torch.Tensor,
+        return_attention: bool = False,
+    ) -> torch.Tensor:
         x = self.embedding(x.long())
 
         noise_rate = einops.rearrange(noise_rate, "batch -> batch 1 1").float()
         x += self.noise_rate_embedding(noise_rate)
 
+        block_attentions = []
+
         for block in self.blocks:
+            if return_attention:
+                x, att = block(x, x, return_attention=True)
+                block_attentions.append(att)
+                continue
+            
             x = block(x, x)
 
         logits = x @ self.embedding.weight.T
+
+        if return_attention:
+            return logits, torch.stack(block_attentions, dim=1)
 
         return logits
 
