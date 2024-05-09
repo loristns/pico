@@ -1,4 +1,5 @@
 import logging
+from collections import deque
 from typing import Optional
 
 import einops
@@ -29,7 +30,7 @@ config = {
     "dim": 128,
     "num_blocks": 8,
     "num_heads": 4,
-    "query_capacity": 64,
+    "query_capacity": [1, 0.25, 0.25, 0.25],
     "batch_size": 128,
     "noise_levels": 16,
     "learning_rate": 1e-3,
@@ -139,7 +140,7 @@ class CapacitiveMHA(nn.Module):
         query_seq_dim: int,
         value_seq_dim: int,
         num_heads: int,
-        query_capacity: int,
+        query_capacity: float,
     ):
         super().__init__()
         self.num_heads = num_heads
@@ -168,15 +169,16 @@ class CapacitiveMHA(nn.Module):
         """
         # First, we limit the number of tokens to consider in the query sequence
         # (capacity resampling) using a mixture-of-depths like mechanism
+        query_capacity_abs = int(self.query_capacity * query_seq.size(1))
 
         # Weight most relevant tokens from query_seq
         # (batch_size, query_seq_len, 1)
         router_weights = self.router(query_seq).to(torch.float32)
 
         # Select top-k tokens
-        # (batch_size, query_capacity, 1)
+        # (batch_size, query_capacity_abs, 1)
         top_router_weights, top_router_indices = torch.topk(
-            router_weights, k=self.query_capacity, dim=1, sorted=False
+            router_weights, k=query_capacity_abs, dim=1, sorted=False
         )
 
         # Reorder top_router_indices and top_router_weights in the order of original query_seq
@@ -200,7 +202,7 @@ class CapacitiveMHA(nn.Module):
         # Then, we perform "standard" MHA
 
         # q, k and v are of shape (batch_size, seq_len, emb_dim * num_heads)
-        # where seq_len is query_capacity for q, and value_seq_len for k and v
+        # where seq_len is query_capacity_abs for q, and value_seq_len for k and v
         q: torch.Tensor = self.q_proj(resampled_query_seq)
         kv: torch.Tensor = self.kv_proj(value_seq)
         k, v = kv.chunk(2, dim=-1)
@@ -255,7 +257,7 @@ class Block(nn.Module):
         query_seq_dim: int,
         value_seq_dim: int,
         num_heads: int,
-        query_capacity: int,
+        query_capacity: float,
     ):
         super().__init__()
 
@@ -304,17 +306,21 @@ class DenoisingModel(L.LightningModule):
         self.embedding = nn.Embedding(256, config["dim"])
         self.noise_rate_embedding = nn.Linear(1, config["dim"])
 
-        self.blocks = nn.ModuleList(
-            [
+        blocks = []
+        block_capacity = deque(config["query_capacity"])
+
+        for _ in range(config["num_blocks"]):
+            blocks.append(
                 Block(
                     query_seq_dim=config["dim"],
                     value_seq_dim=config["dim"],
                     num_heads=config["num_heads"],
-                    query_capacity=config["query_capacity"],
+                    query_capacity=block_capacity[0],
                 )
-                for _ in range(config["num_blocks"])
-            ]
-        )
+            )
+            block_capacity.rotate(1)
+
+        self.blocks = nn.ModuleList(blocks)
 
     def forward(
         self,
@@ -403,7 +409,7 @@ def train(
     dim: Optional[int] = None,
     num_blocks: Optional[int] = None,
     num_heads: Optional[int] = None,
-    query_capacity: Optional[int] = None,
+    query_capacity: Optional[list[float]] = None,
     batch_size: Optional[int] = None,
     noise_levels: Optional[int] = None,
     learning_rate: Optional[float] = None,
@@ -455,7 +461,7 @@ def train(
 def test(version: str, epoch: int, step: int):
     model = DenoisingModel.load_from_checkpoint(
         f"pico/{version}/checkpoints/epoch={epoch}-step={step}.ckpt",
-        # query_capacity=128
+        # query_capacity=[1]
     )
     model.eval()
 
