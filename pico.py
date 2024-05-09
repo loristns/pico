@@ -97,6 +97,7 @@ class DenoisingDataset(Dataset):
 #################################
 
 
+# TODO: investigate if this implementation respects the original paper
 class RotaryEmbedding(nn.Module):
     def __init__(self, dim: int, base=10_000):
         super().__init__()
@@ -336,12 +337,11 @@ class DenoisingModel(L.LightningModule):
         block_attentions = []
 
         for block in self.blocks:
+            x = block(x, x, return_attention)
+
             if return_attention:
-                x, att = block(x, x, return_attention=True)
+                x, att = x
                 block_attentions.append(att)
-                continue
-            
-            x = block(x, x)
 
         logits = x @ self.embedding.weight.T
 
