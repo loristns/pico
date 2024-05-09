@@ -135,6 +135,12 @@ class RotaryEmbedding(nn.Module):
         return x * rotary_matrix
 
 
+class SwiGLU(nn.Module):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x, gate = x.chunk(2, dim=-1)
+        return F.silu(gate) * x
+
+
 class CapacitiveMHA(nn.Module):
     def __init__(
         self,
@@ -244,12 +250,6 @@ class CapacitiveMHA(nn.Module):
         )
 
         return output
-
-
-class SwiGLU(nn.Module):
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x, gate = x.chunk(2, dim=-1)
-        return F.silu(gate) * x
 
 
 class Block(nn.Module):
