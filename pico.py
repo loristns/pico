@@ -5,16 +5,17 @@ from typing import Optional
 import einops
 import lightning as L
 import rich
-import rich.box
 import torch
 import torch.nn.functional as F
 import typer
 from deepspeed.ops.lamb import FusedLamb
 from lightning.pytorch.callbacks import RichProgressBar
-from lightning.pytorch.loggers import WandbLogger
+from lightning.pytorch.loggers import TensorBoardLogger, WandbLogger
 from lightning.pytorch.utilities import grad_norm
+from rich.live import Live
 from rich.logging import RichHandler
 from rich.table import Table
+from rich.text import Text
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
 
@@ -70,7 +71,6 @@ class DenoisingDataset(Dataset):
 
         noise_level = (idx % (self.noise_levels - 1)) + 1
         noise_rate = noise_level / self.noise_levels
-        noise_rate = (1 - noise_rate) ** 0.5  # Sqrt schedule
 
         n_noisy_bytes = int(noise_rate * self.context_len)
 
@@ -323,6 +323,13 @@ class DenoisingModel(L.LightningModule):
 
         self.blocks = nn.ModuleList(blocks)
 
+    @property
+    def example_input_array(self):
+        return (
+            torch.randint(256, (1, self.hparams["context_len"])).cuda(),
+            torch.tensor([1]).cuda(),
+        )
+
     def forward(
         self,
         x: torch.Tensor,
@@ -445,12 +452,22 @@ def train(
 
     model = DenoisingModel(train_config)
 
+    if not disable_wandb:
+        train_logger = WandbLogger(project="pico", log_model="all")
+        train_logger.log_hyperparams(train_config)
+        train_logger.log_graph(model)
+        # train_logger.watch(model, log="all")
+    else:
+        train_logger = TensorBoardLogger(
+            save_dir="tensorboard", name="pico", log_graph=True
+        )
+
     trainer = L.Trainer(
         max_epochs=train_config["max_epochs"],
         accelerator="gpu",
         precision="16-mixed",
         callbacks=[RichProgressBar()],
-        logger=None if disable_wandb else WandbLogger(project="pico"),
+        logger=train_logger,
         limit_train_batches=0.125,
     )
 
@@ -458,7 +475,13 @@ def train(
 
 
 @app.command()
-def test(version: str, epoch: int, step: int):
+def test(
+    version: str,
+    epoch: int,
+    step: int,
+    prompt: str = "",
+    denoise_rate: float = 0.1,
+):
     model = DenoisingModel.load_from_checkpoint(
         f"pico/{version}/checkpoints/epoch={epoch}-step={step}.ckpt",
         # query_capacity=[1]
@@ -474,29 +497,54 @@ def test(version: str, epoch: int, step: int):
             .unsqueeze(0)
             .cuda()
         )
+        # Insert prompt
+        prompt_tensor = torch.tensor(
+            list(bytes(prompt, encoding="utf-8")), dtype=torch.uint8
+        )
+        x[:, : prompt_tensor.size(0)] = prompt_tensor
 
-        noise_rate = torch.tensor([1], device="cuda")
+        noise_rate = torch.tensor([1.0], device="cuda")
 
-        logger.info(bytes(x.tolist()[0]))
+        with Live() as live:
+            for level in range(int(config["noise_levels"] / denoise_rate)):
+                noise_rate[0] = level / config["noise_levels"] * denoise_rate
+                logits = F.softmax(model(x, noise_rate), dim=-1)
 
-        for level in range(config["noise_levels"] * 10):
-            noise_rate[0] = (config["noise_levels"] - level) / config["noise_levels"]
-            noise_rate = (1 - noise_rate) ** 0.5  # Sqrt schedule
-            logits = F.softmax(model(x, noise_rate / 10), dim=-1)
+                # Absolute sampling:
+                # logits = logits.argmax(-1)
 
-            # Absolute sampling:
-            # logits = logits.argmax(-1)
+                # Relative sampling:
+                logits = torch.tensor(
+                    [torch.multinomial(p, 1) for p in logits.squeeze()], device="cuda"
+                ).unsqueeze(0)
 
-            # Relative sampling:
-            logits = torch.tensor(
-                [torch.multinomial(p, 1) for p in logits.squeeze()], device="cuda"
-            ).unsqueeze(0)
+                x = logits
+                # Force prompt to stay at each steps
+                x[:, : prompt_tensor.size(0)] = prompt_tensor
 
-            logger.info(bytes(logits.tolist()[0]))
+                # Log
+                table = Table(style="green", width=100)
+                table.add_column("Rate")
+                table.add_column("Sample", ratio=0.9)
 
-            x = logits
+                rate_text = Text(
+                    f"{round(100 * noise_rate[0].cpu().tolist(), 2)}%",
+                    style="bold blue",
+                )
 
-        print(bytes(logits.tolist()[0]).decode("utf-8"))
+                try:
+                    logits_text = Text(bytes(logits.tolist()[0]).decode("utf-8"))
+                    logits_text.stylize("yellow", 0, len(prompt))  # Highlight prompt
+                # In case we can't decode the bytes, try to print them as is
+                except UnicodeDecodeError:
+                    logits_text = Text(bytes(logits.tolist()[0]).__repr__())
+                    prompt_repr_len = (
+                        len(bytes(prompt, encoding="utf-8").__repr__()) - 3
+                    )
+                    logits_text.stylize("yellow", 2, prompt_repr_len + 2)
+
+                table.add_row(rate_text, logits_text)
+                live.update(table)
 
 
 if __name__ == "__main__":
