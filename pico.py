@@ -481,6 +481,7 @@ def test(
     step: int,
     prompt: str = "",
     denoise_rate: float = 0.1,
+    temperature: float = 1.0,
 ):
     model = DenoisingModel.load_from_checkpoint(
         f"pico/{version}/checkpoints/epoch={epoch}-step={step}.ckpt",
@@ -508,7 +509,7 @@ def test(
         with Live() as live:
             for level in range(int(config["noise_levels"] / denoise_rate)):
                 noise_rate[0] = level / config["noise_levels"] * denoise_rate
-                logits = F.softmax(model(x, noise_rate), dim=-1)
+                logits = F.softmax(model(x, noise_rate) * temperature, dim=-1)
 
                 # Absolute sampling:
                 # logits = logits.argmax(-1)
