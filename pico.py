@@ -136,12 +136,25 @@ class RotaryEmbedding(nn.Module):
 
 
 class SwiGLU(nn.Module):
+    def __init__(self, dim: int, mult=2):
+        super().__init__()
+        self.fc1 = nn.Linear(dim, dim * mult)
+        self.fc2 = nn.Linear(dim * mult // 2, dim)
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.fc1(x)
         x, gate = x.chunk(2, dim=-1)
-        return F.silu(gate) * x
+        x = F.silu(gate) * x
+        x = self.fc2(x)
+
+        return x
 
 
-class CapacitiveMHA(nn.Module):
+class MHA(nn.Module):
+    """
+    Non-causal multi-head attention module with rotary embeddings.
+    """
+
     def __init__(
         self,
         query_seq_dim: int,
@@ -168,49 +181,23 @@ class CapacitiveMHA(nn.Module):
             self.emb_dim * self.num_heads, query_seq_dim, bias=False
         )
 
-    def forward(self, query_seq: torch.Tensor, value_seq: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        query_seq: torch.Tensor,
+        value_seq: torch.Tensor,
+        query_seq_pos: Optional[torch.Tensor] = None,
+        value_seq_pos: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Args:
             query_seq: A Tensor of shape (batch_size, query_seq_len, query_seq_dim)
             value_seq: A Tensor of shape (batch_size, value_seq_len, value_seq_dim)
+            query_seq_pos: A Tensor of shape (batch_size, query_seq_len) containing the positions of the elements in the query sequence.
+            value_seq_pos: A Tensor of shape (batch_size, value_seq_len) containing the positions of the elements in the value sequence.
         """
-        # First, we limit the number of tokens to consider in the query sequence
-        # (capacity resampling) using a mixture-of-depths like mechanism
-        query_capacity_abs = int(self.query_capacity * query_seq.size(1))
-
-        # Weight most relevant tokens from query_seq
-        # (batch_size, query_seq_len, 1)
-        router_weights = self.router(query_seq).to(torch.float32)
-
-        # Select top-k tokens
-        # (batch_size, query_capacity_abs, 1)
-        top_router_weights, top_router_indices = torch.topk(
-            router_weights, k=query_capacity_abs, dim=1, sorted=False
-        )
-
-        # Reorder top_router_indices and top_router_weights in the order of original query_seq
-        # NOTE: This is not necessary here as we do non-causal attention but I keep it for reference
-        # top_router_indices, top_router_order = torch.sort(top_router_indices, dim=1)
-        # top_router_weights = torch.gather(
-        #     top_router_weights, dim=1, index=top_router_order
-        # )
-
-        # Duplicate top_router_indices over each emb_dim for gather/scatter operations
-        top_router_indices_exp = einops.repeat(
-            top_router_indices,
-            "batch capacity 1 -> batch capacity emb_dim",
-            emb_dim=query_seq.size(-1),
-        )
-
-        resampled_query_seq = torch.gather(
-            query_seq, dim=1, index=top_router_indices_exp
-        )
-
-        # Then, we perform "standard" MHA
-
         # q, k and v are of shape (batch_size, seq_len, emb_dim * num_heads)
-        # where seq_len is query_capacity_abs for q, and value_seq_len for k and v
-        q: torch.Tensor = self.q_proj(resampled_query_seq)
+        # where seq_len is query_seq_len for q, and value_seq_len for k and v
+        q: torch.Tensor = self.q_proj(query_seq)
         kv: torch.Tensor = self.kv_proj(value_seq)
         k, v = kv.chunk(2, dim=-1)
 
@@ -222,13 +209,19 @@ class CapacitiveMHA(nn.Module):
         k = einops.rearrange(k, split_heads, num_heads=self.num_heads)
         v = einops.rearrange(v, split_heads, num_heads=self.num_heads)
 
-        # Apply rotary embeddings
-        q_pos = einops.rearrange(
-            top_router_indices, "batch capacity 1 -> batch 1 capacity"
-        )
+        # Add a dim for the heads to the positional encodings
+        if query_seq_pos is not None:
+            query_seq_pos = einops.rearrange(
+                query_seq_pos, "batch seq_len -> batch 1 seq_len"
+            )
+        if value_seq_pos is not None:
+            value_seq_pos = einops.rearrange(
+                value_seq_pos, "batch seq_len -> batch 1 seq_len"
+            )
 
-        q = self.q_rope(q, q_pos)
-        k = self.k_rope(k)
+        # Apply rotary embeddings
+        q = self.q_rope(q, query_seq_pos)
+        k = self.k_rope(k, value_seq_pos)
 
         # Efficiently compute attention
         att = F.scaled_dot_product_attention(q, k, v)
@@ -239,58 +232,106 @@ class CapacitiveMHA(nn.Module):
         )
         att = self.out_proj(att)
 
-        # Finally, we create a sparse tensor with the resampled query tokens
-        # at their original positions in the query sequence
-        output = torch.zeros_like(query_seq)
-        output = torch.scatter(
-            output,
-            dim=1,
-            index=top_router_indices_exp,
-            src=att * top_router_weights,
-        )
-
-        return output
+        return att
 
 
 class Block(nn.Module):
+    """
+    A parallel-style transformer block with a mixture-of-depths like mechanism to limit the number of tokens
+    to consider in the attention query sequence.
+    """
+
     def __init__(
         self,
-        query_seq_dim: int,
-        value_seq_dim: int,
+        seq_dim: int,
         num_heads: int,
         query_capacity: float,
     ):
         super().__init__()
 
-        self.query_seq_dim = query_seq_dim
-        self.value_seq_dim = value_seq_dim
+        self.seq_dim = seq_dim
+        self.query_capacity = query_capacity
 
-        self.query_ln = nn.LayerNorm(query_seq_dim)
-        self.value_ln = nn.LayerNorm(value_seq_dim)
+        self.router = nn.Linear(seq_dim, 1, bias=False)
 
-        self.mha = CapacitiveMHA(
-            query_seq_dim, value_seq_dim, num_heads, query_capacity
-        )
+        self.query_ln = nn.LayerNorm(seq_dim)
+        self.value_ln = nn.LayerNorm(seq_dim)
 
-        self.ffn = nn.Sequential(
-            nn.Linear(query_seq_dim, query_seq_dim * 2, bias=False),
-            SwiGLU(),  # SwiGLU divides dim by 2
-            nn.Linear(query_seq_dim, query_seq_dim, bias=False),
-        )
+        self.mha = MHA(seq_dim, seq_dim, num_heads, query_capacity)
+        self.ffn = SwiGLU(seq_dim)
 
     def forward(
         self,
-        query_seq: torch.Tensor,
-        value_seq: torch.Tensor,
+        seq: torch.Tensor,
         return_attention: bool = False,
     ) -> torch.Tensor:
-        query_seq_norm = self.query_ln(query_seq)
-        value_seq_norm = self.value_ln(value_seq)
+        #################################
+        # MoD-like resampling mechanism #
+        #################################
+        # First, we limit the number of tokens to consider in the query sequence
+        # (capacity resampling) using a mixture-of-depths like mechanism
+        query_capacity_abs = int(self.query_capacity * seq.size(1))
 
-        att = self.mha(query_seq_norm, value_seq_norm)
-        ffn = self.ffn(query_seq_norm)
+        # Weight most relevant tokens from sequence
+        # (batch_size, seq_len, 1)
+        router_weights = self.router(seq)
+        router_weights = F.softmax(
+            router_weights, dim=1
+        )  # This is not in the MoD paper, but I find it useful
 
-        out = query_seq + att + ffn
+        # Select top-k tokens
+        # (batch_size, query_capacity_abs, 1)
+        top_router_weights, top_router_indices = torch.topk(
+            router_weights, k=query_capacity_abs, dim=1, sorted=False
+        )
+
+        # Reorder top_router_indices and top_router_weights in the order of original sequence
+        # NOTE: This is not necessary here as we do non-causal attention but I keep it for reference
+        # top_router_indices, top_router_order = torch.sort(top_router_indices, dim=1)
+        # top_router_weights = torch.gather(
+        #     top_router_weights, dim=1, index=top_router_order
+        # )
+
+        # Duplicate top_router_indices over each emb_dim for gather/scatter operations
+        top_router_indices_exp = einops.repeat(
+            top_router_indices,
+            "batch capacity 1 -> batch capacity emb_dim",
+            emb_dim=seq.size(-1),
+        )
+
+        # Create query sequence by resampling the original sequence
+        query_seq = torch.gather(seq, dim=1, index=top_router_indices_exp)
+
+        query_seq = self.query_ln(query_seq)
+        value_seq = self.value_ln(seq)
+
+        ##############################
+        # Parallel-style transformer #
+        ##############################
+
+        # Multi-head attention
+        # query sequence is resampled, value sequence is the full sequence
+        att = self.mha(
+            query_seq=query_seq,
+            value_seq=value_seq,
+            # query_seq_pos: (batch_size, query_capacity_abs)
+            query_seq_pos=top_router_indices.squeeze(-1),
+        )
+
+        # In parallel, apply a feed-forward network
+        ffn = self.ffn(query_seq)
+
+        #############################
+        # Update the input sequence #
+        #############################
+
+        # Update the original sequence with the attention and the feed-forward network    
+        out = torch.scatter_add(
+            seq,
+            dim=1,
+            index=top_router_indices_exp,
+            src=(att + ffn) * top_router_weights,
+        )
 
         if return_attention:
             # Return attention output for visualization
@@ -307,14 +348,18 @@ class DenoisingModel(L.LightningModule):
         self.embedding = nn.Embedding(256, config["dim"])
         self.noise_rate_embedding = nn.Linear(1, config["dim"])
 
+        # TODO: remove this, this is a temporary retrocompatibility fix
+        # for previous query_capacity config
+        if isinstance(config["query_capacity"], int):
+            config["query_capacity"] = [1, 0.25, 0.25, 0.25]
+
         blocks = []
         block_capacity = deque(config["query_capacity"])
 
         for _ in range(config["num_blocks"]):
             blocks.append(
                 Block(
-                    query_seq_dim=config["dim"],
-                    value_seq_dim=config["dim"],
+                    seq_dim=config["dim"],
                     num_heads=config["num_heads"],
                     query_capacity=block_capacity[0],
                 )
@@ -344,7 +389,7 @@ class DenoisingModel(L.LightningModule):
         block_attentions = []
 
         for block in self.blocks:
-            x = block(x, x, return_attention)
+            x = block(x, return_attention)
 
             if return_attention:
                 x, att = x
