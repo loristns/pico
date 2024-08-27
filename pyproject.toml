@@ -1,32 +1,23 @@
 [tool.poetry]
 name = "xtns-pico"
 version = "0.1.0"
-description = ""
-authors = ["loristns"]
+description = "Pico SLM"
+authors = ["Your Name <you@example.com>"]
 readme = "README.md"
+package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.12"
-torch = "^2.2.2"
-typer = "^0.12.1"
-lightning = {extras = ["extra"], version = "^2.2.4"}
-rich = "^13.7.1"
-wandb = "^0.16.6"
-datasets = "^2.18.0"
+torch = {version = "2.5.0.dev20240826+cu121", allow-prereleases = true, source = "pytorch-nightly"}
 einops = "^0.8.0"
-deepspeed = "^0.14.2"
-tensorboard = "^2.16.2"
 
 [tool.poetry.group.dev.dependencies]
-ruff = "^0.3.5"
+ruff = "^0.6.2"
 
-[tool.poetry.group.experiments]
-optional = true
-
-[tool.poetry.group.experiments.dependencies]
-ipykernel = "^6.29.4"
-scikit-learn = "^1.4.2"
-matplotlib = "^3.8.4"
+[[tool.poetry.source]]
+name = "pytorch-nightly"
+url = "https://download.pytorch.org/whl/nightly/cu121"
+priority = "explicit"
 
 [build-system]
 requires = ["poetry-core"]
