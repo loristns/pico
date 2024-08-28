@@ -367,19 +367,23 @@ files = [
 
 [[package]]
 name = "setuptools"
-version = "73.0.1"
+version = "74.0.0"
 description = "Easily download, build, install, upgrade, and uninstall Python packages"
 optional = false
 python-versions = ">=3.8"
 files = [
-    {file = "setuptools-73.0.1-py3-none-any.whl", hash = "sha256:b208925fcb9f7af924ed2dc04708ea89791e24bde0d3020b27df0e116088b34e"},
-    {file = "setuptools-73.0.1.tar.gz", hash = "sha256:d59a3e788ab7e012ab2c4baed1b376da6366883ee20d7a5fc426816e3d7b1193"},
+    {file = "setuptools-74.0.0-py3-none-any.whl", hash = "sha256:0274581a0037b638b9fc1c6883cc71c0210865aaa76073f7882376b641b84e8f"},
+    {file = "setuptools-74.0.0.tar.gz", hash = "sha256:a85e96b8be2b906f3e3e789adec6a9323abf79758ecfa3065bd740d81158b11e"},
 ]
 
 [package.extras]
+check = ["pytest-checkdocs (>=2.4)", "pytest-ruff (>=0.2.1)", "ruff (>=0.5.2)"]
 core = ["importlib-metadata (>=6)", "importlib-resources (>=5.10.2)", "jaraco.text (>=3.7)", "more-itertools (>=8.8)", "packaging (>=24)", "platformdirs (>=2.6.2)", "tomli (>=2.0.1)", "wheel (>=0.43.0)"]
+cover = ["pytest-cov"]
 doc = ["furo", "jaraco.packaging (>=9.3)", "jaraco.tidelift (>=1.4)", "pygments-github-lexers (==0.0.5)", "pyproject-hooks (!=1.1)", "rst.linker (>=1.9)", "sphinx (>=3.5)", "sphinx-favicon", "sphinx-inline-tabs", "sphinx-lint", "sphinx-notfound-page (>=1,<2)", "sphinx-reredirects", "sphinxcontrib-towncrier", "towncrier (<24.7)"]
-test = ["build[virtualenv] (>=1.0.3)", "filelock (>=3.4.0)", "importlib-metadata", "ini2toml[lite] (>=0.14)", "jaraco.develop (>=7.21)", "jaraco.envs (>=2.2)", "jaraco.path (>=3.2.0)", "jaraco.test", "mypy (==1.11.*)", "packaging (>=23.2)", "pip (>=19.1)", "pyproject-hooks (!=1.1)", "pytest (>=6,!=8.1.*)", "pytest-checkdocs (>=2.4)", "pytest-cov", "pytest-enabler (>=2.2)", "pytest-home (>=0.5)", "pytest-mypy", "pytest-perf", "pytest-ruff (<0.4)", "pytest-ruff (>=0.2.1)", "pytest-ruff (>=0.3.2)", "pytest-subprocess", "pytest-timeout", "pytest-xdist (>=3)", "tomli", "tomli-w (>=1.0.0)", "virtualenv (>=13.0.0)", "wheel (>=0.44.0)"]
+enabler = ["pytest-enabler (>=2.2)"]
+test = ["build[virtualenv] (>=1.0.3)", "filelock (>=3.4.0)", "ini2toml[lite] (>=0.14)", "jaraco.develop (>=7.21)", "jaraco.envs (>=2.2)", "jaraco.path (>=3.2.0)", "jaraco.test", "packaging (>=23.2)", "pip (>=19.1)", "pyproject-hooks (!=1.1)", "pytest (>=6,!=8.1.*)", "pytest-home (>=0.5)", "pytest-perf", "pytest-subprocess", "pytest-timeout", "pytest-xdist (>=3)", "tomli-w (>=1.0.0)", "virtualenv (>=13.0.0)", "wheel (>=0.44.0)"]
+type = ["importlib-metadata (>=7.0.2)", "jaraco.develop (>=7.21)", "mypy (==1.11.*)", "pytest-mypy"]
 
 [[package]]
 name = "sympy"
@@ -400,20 +404,20 @@ dev = ["hypothesis (>=6.70.0)", "pytest (>=7.1.0)"]
 
 [[package]]
 name = "torch"
-version = "2.5.0.dev20240826+cu121"
+version = "2.5.0.dev20240823+cu121"
 description = "Tensors and Dynamic neural networks in Python with strong GPU acceleration"
 optional = false
 python-versions = ">=3.8.0"
 files = [
-    {file = "torch-2.5.0.dev20240826+cu121-cp310-cp310-linux_x86_64.whl", hash = "sha256:8e0de3882a4be8176186669f9cbf7650daabcd7c3dca50a7349bcb5bb72d8167"},
-    {file = "torch-2.5.0.dev20240826+cu121-cp310-cp310-win_amd64.whl", hash = "sha256:4c57274d3ae22fcc98b7444798af9e40f0f9b8ba11619ef9aa42e8b20cbd0530"},
-    {file = "torch-2.5.0.dev20240826+cu121-cp311-cp311-linux_x86_64.whl", hash = "sha256:0a38b0eeb4e498f81210434de1c327296f003b3611e7f4579c0a45081fb61827"},
-    {file = "torch-2.5.0.dev20240826+cu121-cp311-cp311-win_amd64.whl", hash = "sha256:eb61614d72475aa37cb10e010d4eef07d4c5072bb95c766c0515b3717e9ff7cf"},
-    {file = "torch-2.5.0.dev20240826+cu121-cp312-cp312-linux_x86_64.whl", hash = "sha256:ec68e8735741a59fcffe603286fff27f8403f37fb04dc2a3d63e2f0e5e5bd456"},
-    {file = "torch-2.5.0.dev20240826+cu121-cp312-cp312-win_amd64.whl", hash = "sha256:9a6b84c1386c0f541070469f3dac3dde9bb936f2c0b238db0ab1b4257a56a22e"},
-    {file = "torch-2.5.0.dev20240826+cu121-cp313-cp313-linux_x86_64.whl", hash = "sha256:74318a6e4dadab9f40a314ed330a6216a05ac83e8dda5c6962490696b9841f52"},
-    {file = "torch-2.5.0.dev20240826+cu121-cp39-cp39-linux_x86_64.whl", hash = "sha256:0e87230b05697da41a1a7a08c93ea5a52828c9b1c0c0afdb617d20c6b3fc9046"},
-    {file = "torch-2.5.0.dev20240826+cu121-cp39-cp39-win_amd64.whl", hash = "sha256:e84eedadafde78a1d4055edaa03079144dceedfaac1d31d144f6b0c99d439e62"},
+    {file = "torch-2.5.0.dev20240823+cu121-cp310-cp310-linux_x86_64.whl", hash = "sha256:20df2a09a3b04f3a9af7aa36e86691e15eec3253471c3bbc078b2d32cc4cd448"},
+    {file = "torch-2.5.0.dev20240823+cu121-cp310-cp310-win_amd64.whl", hash = "sha256:9d7661f1aeec7d40304f4ed2d7094f24d0635cb0ca6e66f3a021e1e039939b4d"},
+    {file = "torch-2.5.0.dev20240823+cu121-cp311-cp311-linux_x86_64.whl", hash = "sha256:8b528b15c704feaa41ac39ea68c959f21709294ef64f9b0c327aba7a938a9392"},
+    {file = "torch-2.5.0.dev20240823+cu121-cp311-cp311-win_amd64.whl", hash = "sha256:457391d397825942a2db323412423346cccf6d2a07b1938f1d6eb84ef9ba6147"},
+    {file = "torch-2.5.0.dev20240823+cu121-cp312-cp312-linux_x86_64.whl", hash = "sha256:8b765b406dc41cd155d2e4a2438a426a7670c57cd9ae98b0a1f390e8f928863f"},
+    {file = "torch-2.5.0.dev20240823+cu121-cp312-cp312-win_amd64.whl", hash = "sha256:9b0aa7212ae18c1a3df2a65d450d8859d4a9d28d09f01c6ed3ddbac7a17e628c"},
+    {file = "torch-2.5.0.dev20240823+cu121-cp313-cp313-linux_x86_64.whl", hash = "sha256:ef0e6cfafe2f4cdde869ada390bffe13401004fa8972e4e87a5f9acca73fab45"},
+    {file = "torch-2.5.0.dev20240823+cu121-cp39-cp39-linux_x86_64.whl", hash = "sha256:5fb7c54f6c03ae3346f53f9981f1462c7dd2e4cbc73ad1dade38a52ead3fab40"},
+    {file = "torch-2.5.0.dev20240823+cu121-cp39-cp39-win_amd64.whl", hash = "sha256:92c7808f0733db5a029cd63643de2bf70bf020ce108c4159c5f565f434a3a648"},
 ]
 
 [package.dependencies]
@@ -460,4 +464,4 @@ files = [
 [metadata]
 lock-version = "2.0"
 python-versions = "^3.12"
-content-hash = "a50d3e3aa438a8c6e054305de1002ac55d0d0fb0ae5dcf3823c99cc7e4132bfb"
+content-hash = "1827502aed62123fa8ce8e201c5d828183dac62f06679b930f74289e27bfd529"

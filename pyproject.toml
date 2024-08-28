@@ -8,7 +8,7 @@ package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.12"
-torch = {version = "2.5.0.dev20240826+cu121", allow-prereleases = true, source = "pytorch-nightly"}
+torch = {version = "2.5.0.dev20240823+cu121", allow-prereleases = true, source = "pytorch-nightly"}
 einops = "^0.8.0"
 
 [tool.poetry.group.dev.dependencies]

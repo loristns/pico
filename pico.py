@@ -1,5 +1,5 @@
 from functools import lru_cache, partial
-from typing import Optional
+from typing import Iterable, Optional
 
 import einops
 import torch
@@ -8,7 +8,28 @@ from torch.nn import functional as F
 from torch.nn.attention import flex_attention
 
 # Hyperparameters
-hyperparams = {}
+params = {
+    "dim": 64,
+    "encoder": {
+        "num_blocks": 2,
+        "att_q_heads": 16,
+        "att_kv_heads": 8,
+        "att_window_size": 128,
+    },
+    "mod": {
+        "capacity_factor": 0.25,
+        "num_blocks": 16,
+        "att_q_heads": 16,
+        "att_kv_heads": 8,
+        "att_window_size": 128,
+    },
+    "decoder": {
+        "num_blocks": 2,
+        "att_q_heads": 16,
+        "att_kv_heads": 8,
+        "att_window_size": 128,
+    },
+}
 
 
 # Model definition
@@ -20,6 +41,7 @@ def _block_mask(seq_len: int, window_size: Optional[int] = None):
         if window_size is None:
             return causal_mask
 
+        # If a window size is provided, apply a window mask (local attention)
         window_mask = (q_idx - kv_idx) <= window_size
         return causal_mask & window_mask
 
@@ -70,6 +92,7 @@ class GQA(nn.Module):
             dim=self.dim,
         )
 
+        # Split query, key and value heads
         # q: [batch, q_heads, seq_len, dim]
         # k: [batch, kv_heads, seq_len, dim]
         # v: [batch, kv_heads, seq_len, dim]
@@ -101,13 +124,13 @@ class SwiGLU(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, dim: int, att_q_heads: int, att_kv_heads: int):
+    def __init__(self, dim: int, att_q_heads: int, att_kv_heads: int, att_window_size: Optional[int] = None):
         super().__init__()
 
         self.norm1 = nn.LayerNorm(dim)
         self.norm2 = nn.LayerNorm(dim)
 
-        self.att = GQA(dim, att_q_heads, att_kv_heads)
+        self.att = GQA(dim, att_q_heads, att_kv_heads, att_window_size)
         self.glu = SwiGLU(dim)
 
     def forward(self, x: torch.Tensor):
@@ -116,13 +139,25 @@ class Block(nn.Module):
         return x
 
 
+class BlockSeq(nn.Module):
+    def __init__(self, blocks: Iterable[Block]):
+        super().__init__()
+        self.blocks = nn.ModuleList(blocks)
+
+    def forward(self, x: torch.Tensor):
+        for block in self.blocks:
+            x = block(x)
+
+        return x
+
+
 class MoD(nn.Module):
-    def __init__(self, module: nn.Module, dim: int, capacity_factor: int):
+    def __init__(self, blocks: Iterable[Block], dim: int, capacity_factor: int):
         super().__init__()
         self.dim = dim
         self.capacity_factor = capacity_factor
 
-        self.module = module
+        self.block_seq = BlockSeq(blocks)
         self.router = nn.Linear(dim, 1, bias=False)
 
     def forward(self, x: torch.Tensor):
@@ -162,20 +197,22 @@ class MoD(nn.Module):
         )
 
         # Create resampled sequence
+        # [batch, capacity, dim]
         mod_x = torch.gather(x, dim=1, index=router_top_indices_exp)
 
-        # Apply module
-        mod_out = self.module(mod_x)
+        # Apply blocks
+        mod_x = self.block_seq(mod_x)
 
         # Apply router weights
-        mod_out = mod_out * router_top_weights
+        mod_x = mod_x * router_top_weights
 
-        # Scatter back to original sequence
+        # Scatter back to original sequence (filling the rest with zeros)
+        # [batch, seq_len, dim]
         out = torch.scatter(
             torch.zeros_like(x),
             dim=1,
             index=router_top_indices_exp,
-            src=mod_out,
+            src=mod_x,
         )
 
         # Mixture-of-Depth auxiliary loss
@@ -192,12 +229,66 @@ class MoD(nn.Module):
         return out, mod_loss
 
 
+class Embedding(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.weights = nn.Parameter(torch.randn(256, dim))
+
+    def forward(self, x: torch.Tensor):
+        return F.one_hot(x, num_classes=256).float() @ self.weights
+
+
 class Pico(nn.Module):
-    def __init__(self):
+    def __init__(self, params: dict):
         super().__init__()
 
-    def train_step(self):
-        pass
+        self.embedding = Embedding(params["dim"])
+
+        self.encoder = BlockSeq(
+            Block(
+                params["dim"],
+                params["encoder"]["att_q_heads"],
+                params["encoder"]["att_kv_heads"],
+                params["encoder"]["att_window_size"],
+            )
+            for _ in range(params["encoder"]["num_blocks"])
+        )
+        self.mod = MoD(
+            (
+                Block(
+                    params["dim"],
+                    params["mod"]["att_q_heads"],
+                    params["mod"]["att_kv_heads"],
+                    params["mod"]["att_window_size"],
+                )
+                for _ in range(params["mod"]["num_blocks"])
+            ),
+            params["dim"],
+            params["mod"]["capacity_factor"],
+        )
+        self.decoder = BlockSeq(
+            Block(
+                params["dim"],
+                params["decoder"]["att_q_heads"],
+                params["decoder"]["att_kv_heads"],
+                params["decoder"]["att_window_size"],
+            )
+            for _ in range(params["decoder"]["num_blocks"])
+        )
+
+        self.norm = nn.LayerNorm(params["dim"])
+
+    def forward(self, x: torch.Tensor):
+        x = self.embedding(x)
+
+        x = self.encoder(x)
+        x, aux_loss = self.mod(x)
+        x = self.decoder(x)
+
+        x = self.norm(x)
+        x = x @ self.embedding.weights.T
+
+        return x, aux_loss
 
 
 # Dataloader
@@ -216,13 +307,13 @@ def infer():
 # CLI
 if __name__ == "__main__":
     with torch.device("cuda" if torch.cuda.is_available() else "cpu"):
-        a = GQA(dim=16, q_heads=4, kv_heads=2)
+        pico = Pico(params)
 
-        mod = MoD(a, dim=16, capacity_factor=0.5)
-        mod = mod.eval()
+        print(pico)
 
-        x = torch.randn(1, 10, 16)
-        x, aux_loss = mod(x)
-        print(x, x.shape)
-        print(aux_loss, aux_loss.shape)
-        
+        # Count parameters
+        print(sum(p.numel() for p in pico.parameters() if p.requires_grad))
+
+        x = torch.randint(0, 256, (1, 128*1024))
+        out, aux_loss = pico(x)
+        print(out.shape, aux_loss)
