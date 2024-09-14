@@ -8,17 +8,20 @@ package-mode = false
 
 [tool.poetry.dependencies]
 python = "^3.12"
-torch = {version = "2.5.0.dev20240823+cu121", allow-prereleases = true, source = "pytorch-nightly"}
 einops = "^0.8.0"
+flash-attn = {url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.4cxx11abiFALSE-cp312-cp312-linux_x86_64.whl"}
+torch = {version = "^2.4.0", source = "torch"}
+datasets = "^2.21.0"
+typer = "^0.12.5"
 
 [tool.poetry.group.dev.dependencies]
 ruff = "^0.6.2"
 
-[[tool.poetry.source]]
-name = "pytorch-nightly"
-url = "https://download.pytorch.org/whl/nightly/cu121"
-priority = "explicit"
-
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[[tool.poetry.source]]
+name = "torch"
+url = "https://download.pytorch.org/whl/cu121"
+priority = "explicit"
