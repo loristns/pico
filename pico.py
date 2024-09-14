@@ -1,53 +1,34 @@
+"""
+The Pico byte-level model library.
+
+This file contains the implementation of the Pico model, a byte-level model
+that uses mixture of depth and local attention to reduce the computational cost
+of long byte sequences.
+"""
+
+import dataclasses
+import json
 import os
-from collections.abc import Iterable
+import pathlib
+from dataclasses import dataclass
 from typing import Optional
 
 import einops
 import torch
 import typer
 from flash_attn import flash_attn_func
-
+from safetensors import safe_open
+from safetensors.torch import save_file
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
-# Hyperparameters
-params = {
-    "dim": 384,
-    "context_len": 8*1024,
-    "train": {
-        "file": "data/wikitext-103-v1-train.txt",
-        "batch_size": 8,
-        "learning_rate": 1e-3,
-        "grad_accumulation_steps": 16,
-        "num_epochs": 1,
-        "dropout": 0.2,
-    },
-    "encoder": {
-        "num_blocks": 2,
-        "att_q_heads": 12,
-        "att_kv_heads": 6,
-        "att_window_size": 8,
-    },
-    "mod": {
-        "capacity_factor": 0.125,
-        "num_blocks": 16,
-        "att_q_heads": 12,
-        "att_kv_heads": 6,
-        "att_window_size": 512,
-    },
-    "decoder": {
-        "num_blocks": 1,
-        "att_q_heads": 12,
-        "att_kv_heads": 6,
-        "att_window_size": 8,
-    },
-}
 
-
-# Model definition
+#######################
+#   Building blocks   #
+#######################
 class GQA(nn.Module):
     def __init__(
         self,
@@ -66,7 +47,9 @@ class GQA(nn.Module):
         self.head_dim = dim // q_heads
         self.dropout = dropout
 
-        self.fused_qkv = nn.Linear(dim, (q_heads + 2 * kv_heads) * self.head_dim, bias=False)
+        self.fused_qkv = nn.Linear(
+            dim, (q_heads + 2 * kv_heads) * self.head_dim, bias=False
+        )
         self.proj = nn.Linear(q_heads * self.head_dim, dim, bias=False)
 
         self.alibi_slopes = torch.arange(q_heads)
@@ -146,9 +129,20 @@ class Block(nn.Module):
 
 
 class BlockSeq(nn.Module):
-    def __init__(self, blocks: Iterable[Block]):
+    def __init__(
+        self,
+        num_blocks: int,
+        dim: int,
+        att_q_heads: int,
+        att_kv_heads: int,
+        att_window_size: Optional[int] = None,
+        dropout: float = 0.1,
+    ):
         super().__init__()
-        self.blocks = nn.ModuleList(blocks)
+        self.blocks = nn.ModuleList(
+            Block(dim, att_q_heads, att_kv_heads, att_window_size, dropout)
+            for _ in range(num_blocks)
+        )
 
     def forward(self, x: torch.Tensor):
         for block in self.blocks:
@@ -157,13 +151,29 @@ class BlockSeq(nn.Module):
         return x
 
 
-class MoD(nn.Module):
-    def __init__(self, blocks: Iterable[Block], dim: int, capacity_factor: int):
-        super().__init__()
+class MoDBlockSeq(BlockSeq):
+    def __init__(
+        self,
+        num_blocks: int,
+        capacity_factor: int,
+        dim: int,
+        att_q_heads: int,
+        att_kv_heads: int,
+        att_window_size: Optional[int] = None,
+        dropout: float = 0.1,
+    ):
+        super().__init__(
+            num_blocks,
+            dim,
+            att_q_heads,
+            att_kv_heads,
+            att_window_size,
+            dropout,
+        )
+
         self.dim = dim
         self.capacity_factor = capacity_factor
 
-        self.block_seq = BlockSeq(blocks)
         self.router = nn.Linear(dim, 1, bias=False)
         self.router_scale = nn.Parameter(torch.tensor(1.0))
         self.router_shift = nn.Parameter(torch.tensor(0.0))
@@ -198,7 +208,9 @@ class MoD(nn.Module):
         # Keep original sequence order
         router_top_indices, router_top_order = torch.sort(router_top_indices, dim=1)
         router_top_weights = torch.gather(router_weights, dim=1, index=router_top_order)
-        router_top_weights = (router_top_weights - self.router_shift) * self.router_scale
+        router_top_weights = (
+            router_top_weights - self.router_shift
+        ) * self.router_scale
 
         # Expand indices over each dimensions for gather/scatter operations
         router_top_indices_exp = einops.repeat(
@@ -210,7 +222,7 @@ class MoD(nn.Module):
         mod_x = torch.gather(x, dim=1, index=router_top_indices_exp)
 
         # Apply blocks
-        mod_x = self.block_seq(mod_x)
+        mod_x = super().forward(mod_x)
 
         # Apply router weights
         mod_x = mod_x * router_top_weights
@@ -238,61 +250,101 @@ class MoD(nn.Module):
         return out, mod_loss
 
 
+########################
+#   Model definition   #
+########################
+@dataclass
+class PicoHyperparameters:
+    # Model hyperparameters
+    dim: int = 384
+    context_len: int = 8 * 1024
+    att_q_heads = 12
+    att_kv_heads = 6
+
+    # - Full bytes blocks (FB)
+    fb_num_blocks: int = 2
+    fb_att_window_size: int = 8
+
+    # - Mixture of Depth blocks (MoD)
+    mod_num_blocks: int = 16
+    mod_att_window_size: int = 512
+    mod_capacity_factor: float = 0.125
+
+    # Train hyperparameters
+    file: str = "data/wikitext-103-v1-train.txt"
+    batch_size: int = 8
+    learning_rate: float = 1e-3
+    grad_accumulation_steps: int = 16
+    num_epochs: int = 1
+    dropout: float = 0.2
+
+
 class Pico(nn.Module):
-    def __init__(self, params: dict):
+    def __init__(self, params: PicoHyperparameters):
         super().__init__()
+        self.params = params
 
-        self.embedding = nn.Embedding(256, params["dim"])
+        self.embedding = nn.Embedding(256, params.dim)
 
-        self.encoder = BlockSeq(
-            Block(
-                params["dim"],
-                params["encoder"]["att_q_heads"],
-                params["encoder"]["att_kv_heads"],
-                params["encoder"]["att_window_size"],
-                params["train"]["dropout"],
-            )
-            for _ in range(params["encoder"]["num_blocks"])
-        )
-        self.mod = MoD(
-            (
-                Block(
-                    params["dim"],
-                    params["mod"]["att_q_heads"],
-                    params["mod"]["att_kv_heads"],
-                    params["mod"]["att_window_size"],
-                    params["train"]["dropout"],
-                )
-                for _ in range(params["mod"]["num_blocks"])
-            ),
-            params["dim"],
-            params["mod"]["capacity_factor"],
-        )
-        self.decoder = BlockSeq(
-            Block(
-                params["dim"],
-                params["decoder"]["att_q_heads"],
-                params["decoder"]["att_kv_heads"],
-                params["decoder"]["att_window_size"],
-                params["train"]["dropout"],
-            )
-            for _ in range(params["decoder"]["num_blocks"])
-        )
+        fb_params = {
+            "num_blocks": params.fb_num_blocks,
+            "dim": params.dim,
+            "att_q_heads": params.att_q_heads,
+            "att_kv_heads": params.att_kv_heads,
+            "att_window_size": params.fb_att_window_size,
+            "dropout": params.dropout,
+        }
+        mod_params = {
+            **fb_params,
+            "num_blocks": params.mod_num_blocks,
+            "capacity_factor": params.mod_capacity_factor,
+            "att_window_size": params.mod_att_window_size,
+        }
 
-        self.norm = nn.LayerNorm(params["dim"])
+        self.fb_in = BlockSeq(**fb_params)
+        self.mod = MoDBlockSeq(**mod_params)
+        self.fb_out = BlockSeq(**fb_params)
+
+        self.norm = nn.LayerNorm(params.dim)
 
     def forward(self, x: torch.Tensor):
         x = self.embedding(x)
 
-        x = self.encoder(x)
+        x = self.fb_in(x)
         mod_out, aux_loss = self.mod(x)
         x = x + mod_out
-        x = self.decoder(x)
+        x = self.fb_out(x)
 
         x = self.norm(x)
         x = x @ self.embedding.weight.T
 
         return x, aux_loss
+
+
+#####################
+#   Serialization   #
+#####################
+def save(model: Pico, path: pathlib.Path | str):
+    path = pathlib.Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+
+    save_file(model.state_dict(), path / "model.safetensors")
+
+    with open(path / "hyperparams.json", "w") as f:
+        json.dump(dataclasses.asdict(model.params), f, indent=2)
+
+
+def load(path: pathlib.Path | str):
+    path = pathlib.Path(path)
+
+    with open(path / "hyperparams.json", "r") as f:
+        params = PicoHyperparameters(**json.load(f))
+
+    model = Pico(params)
+    with safe_open(path / "model.safetensors", framework="pt") as f:
+        model.load_state_dict({key: f.get_tensor(key) for key in f.keys()})
+
+    return model
 
 
 # Dataloader
@@ -328,22 +380,20 @@ class PicoDataset(Dataset):
 
 
 # Training loop function
-def train(model: Pico, params, on_step_end=None):
+def train(model: Pico, params: PicoHyperparameters, on_step_end=None):
     torch.manual_seed(0)
-    dataset = PicoDataset(params["train"]["file"], params["context_len"])
+    dataset = PicoDataset(params.file, params.context_len)
 
     with torch.device("cuda" if torch.cuda.is_available() else "cpu"):
         model.train()
         optimizer = torch.optim.AdamW(
-            model.parameters(), lr=params["train"]["learning_rate"], fused=True
+            model.parameters(), lr=params.learning_rate, fused=True
         )
 
-        for epoch in range(params["train"]["num_epochs"]):
+        for epoch in range(params.num_epochs):
             print(f"Epoch: {epoch}")
 
-            for step, (x, y) in enumerate(
-                dataset.dataloader(params["train"]["batch_size"])
-            ):
+            for step, (x, y) in enumerate(dataset.dataloader(params.batch_size)):
                 out, aux_loss = model(x)
 
                 out = einops.rearrange(
@@ -356,10 +406,10 @@ def train(model: Pico, params, on_step_end=None):
                     f"Step: {step}, Loss: {loss.item()} - Aux Loss: {aux_loss.item()}"
                 )
 
-                loss = loss / params["train"]["grad_accumulation_steps"]
+                loss = loss / params.grad_accumulation_steps
                 loss.backward()
 
-                if step % params["train"]["grad_accumulation_steps"] == 0:
+                if step % params.grad_accumulation_steps == 0:
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     optimizer.zero_grad()
@@ -373,7 +423,7 @@ def train(model: Pico, params, on_step_end=None):
 
 
 # Inference function
-def infer(model: Pico, text: str):
+def infer(model: Pico, text: str, params: PicoHyperparameters):
     with torch.device("cuda" if torch.cuda.is_available() else "cpu"):
         with torch.no_grad():
             model.eval()
@@ -384,7 +434,7 @@ def infer(model: Pico, text: str):
 
             print(text, end="", flush=True)
 
-            while i < params["context_len"]:
+            while i < params.context_len:
                 out, _ = model(x)
                 out = out[:, i - 1, :]
 
@@ -396,15 +446,18 @@ def infer(model: Pico, text: str):
 
                 print(chr(next_char.item()), end="", flush=True)
 
+
 # CLI
 @app.command("train")
 def train_command():
-    model = Pico(params).bfloat16().cuda()
-    infer(model, "T")
+    params = PicoHyperparameters()
+    model = Pico(params)
+    model = model.bfloat16().cuda()
+    infer(model, "T", params)
     train(model, params)
     while True:
         print("\n\n----------------- INFERENCE -----------------\n\n")
-        infer(model, "T")
+        infer(model, "T", params)
 
 
 if __name__ == "__main__":
