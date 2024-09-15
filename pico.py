@@ -8,20 +8,22 @@ of long byte sequences.
 
 import dataclasses
 import json
-import os
+import math
 import pathlib
+import time
 from dataclasses import dataclass
-from typing import Optional, Union
+from typing import Dict, Optional, Union
 
 import einops
 import torch
 import typer
+from datasets import Dataset, IterableDataset
 from flash_attn import flash_attn_func
 from safetensors import safe_open
 from safetensors.torch import save_file
 from torch import nn
 from torch.nn import functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader
 
 app = typer.Typer(pretty_exceptions_enable=False)
 
@@ -102,6 +104,7 @@ class SwiGLU(nn.Module):
 
         x = self.fc2(x)
         x = self.dropout(x)
+
         return x
 
 
@@ -183,8 +186,8 @@ class MoDBlockSeq(BlockSeq):
         seq_len = x.shape[1]
 
         # [batch, seq_len, 1]
-        router_weights = self.router(x)
-        router_weights = F.sigmoid(router_weights)
+        router_weights_logits = self.router(x)
+        router_weights = F.sigmoid(router_weights_logits)
 
         # Capacity is the number of elements to keep in the resampled sequence
         if self.training:
@@ -237,8 +240,8 @@ class MoDBlockSeq(BlockSeq):
         )
 
         # Mixture-of-Depth auxiliary loss
-        mod_loss = F.binary_cross_entropy(
-            router_weights,
+        mod_loss = F.binary_cross_entropy_with_logits(
+            router_weights_logits,
             torch.scatter(
                 torch.zeros_like(router_weights),
                 dim=1,
@@ -257,9 +260,8 @@ class MoDBlockSeq(BlockSeq):
 class PicoHyperparameters:
     # Model hyperparameters
     dim: int = 384
-    context_len: int = 8 * 1024
-    att_q_heads = 12
-    att_kv_heads = 6
+    att_q_heads = 9
+    att_kv_heads = 3
 
     # - Full bytes blocks (FB)
     fb_num_blocks: int = 2
@@ -271,12 +273,17 @@ class PicoHyperparameters:
     mod_capacity_factor: float = 0.125
 
     # Train hyperparameters
-    file: str = "data/wikitext-103-v1-train.txt"
+    context_len: int = 8 * 1024
     batch_size: int = 8
-    learning_rate: float = 1e-3
     grad_accumulation_steps: int = 16
-    num_epochs: int = 1
+    learning_rate: float = 1e-3
+    warmup_steps: int = 100
+    max_steps: int = 5000
+    weight_decay: float = 0.1
     dropout: float = 0.2
+
+    # Special sequences
+    eot_seq: str = "<|eot|>"
 
 
 class Pico(nn.Module):
@@ -369,78 +376,132 @@ def load(path: Union[pathlib.Path, str], checkpoint: int = -1):
     return model
 
 
-# Dataloader
-class PicoDataset(Dataset):
-    def __init__(self, file: str, context_len: int):
-        self.file = open(file, "rb")
-        self.context_len = context_len
-
-        self.num_bytes = os.path.getsize(file)
-
-    def __len__(self) -> int:
-        return self.num_bytes // self.context_len - 1
-
-    def __getitem__(self, index):
-        self.file.seek(index * self.context_len)
-        chunk = list(self.file.read(self.context_len + 1))
-        return torch.tensor(chunk[:-1]), torch.tensor(chunk[1:], dtype=torch.long)
-
-    def _collate_fn(self, batch):
-        x, y = zip(*batch)
-        x = torch.stack(x)
-        y = torch.stack(y)
-        return x, y
-
-    def dataloader(self, batch_size: int):
-        return DataLoader(
-            self,
-            batch_size=batch_size,
-            collate_fn=self._collate_fn,
-            shuffle=True,
-            generator=torch.Generator(device="cuda"),
-        )
+################
+#   Training   #
+################
 
 
-# Training loop function
-def train(model: Pico, params: PicoHyperparameters, on_step_end=None):
-    torch.manual_seed(0)
-    dataset = PicoDataset(params.file, params.context_len)
+def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
+    # Utility functions
+    def _processing(batch: Dict[str, list[str]]):
+        chunks = []
+        current_buffer = []
 
-    with torch.device("cuda" if torch.cuda.is_available() else "cpu"):
-        model.train()
-        optimizer = torch.optim.AdamW(
-            model.parameters(), lr=params.learning_rate, fused=True
-        )
+        context_len = model.params.context_len
+        window_len = context_len + 1
 
-        for epoch in range(params.num_epochs):
-            print(f"Epoch: {epoch}")
+        eot_seq = list(model.params.eot_seq.encode("utf-8"))
+        eot_seq_len = len(eot_seq)
 
-            for step, (x, y) in enumerate(dataset.dataloader(params.batch_size)):
-                out, aux_loss = model(x)
+        for text in batch["text"]:
+            tokens = text.encode("utf-8")
 
-                out = einops.rearrange(
-                    out, "batch seq_len probs -> (batch seq_len) probs"
-                )
-                y = einops.rearrange(y, "batch seq_len -> (batch seq_len)")
+            current_buffer.extend(eot_seq)
+            current_buffer.extend(tokens)
 
-                loss = 0.9 * F.cross_entropy(out, y) + 0.1 * aux_loss
-                print(
-                    f"Step: {step}, Loss: {loss.item()} - Aux Loss: {aux_loss.item()}"
-                )
+            # Split the buffer into chunks of window_len
+            while len(current_buffer) >= window_len:
+                chunk = current_buffer[:window_len]
+                chunks.append(chunk)
+                current_buffer = current_buffer[window_len:]
 
-                loss = loss / params.grad_accumulation_steps
-                loss.backward()
+            # Handle the case where appending eot_seq would exceed the window_len
+            while len(current_buffer) + eot_seq_len > window_len:
+                current_buffer = current_buffer[eot_seq_len - 1 :]  # Drop prefix
 
-                if step % params.grad_accumulation_steps == 0:
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-                    optimizer.step()
-                    optimizer.zero_grad()
+        return {
+            "x": torch.tensor(chunks)[:, :-1],
+            "y": torch.tensor(chunks)[:, 1:],
+        }
 
-                if on_step_end:
-                    on_step_end(step, loss.item(), aux_loss.item())
+    def _lr_schedule(step: int):
+        learning_rate = model.params.learning_rate
+        warmup_steps = model.params.warmup_steps
+        max_steps = model.params.max_steps
 
+        if step < warmup_steps:
+            return learning_rate * (step + 1) / warmup_steps
+
+        if step >= max_steps:
+            return 0.1 * learning_rate
+
+        decay_ratio = (step - warmup_steps) / (max_steps - warmup_steps)
+        coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
+        return 0.1 * learning_rate + coeff * 0.9 * learning_rate
+
+    # Configure training
+    device = torch.device("cuda")
+
+    model.train()
+    model.to(device)
+
+    dataloader = DataLoader(
+        dataset.map(_processing, batched=True, remove_columns=["text"]).with_format(
+            "numpy"
+        ),
+        batch_size=model.params.batch_size,
+    )
+
+    trainable_params = {
+        name: param for name, param in model.named_parameters() if param.requires_grad
+    }
+
+    scaler = torch.GradScaler(device)
+    optimizer = torch.optim.AdamW(
+        [
+            {
+                "params": [
+                    param for param in trainable_params.values() if param.dim() >= 2
+                ],
+                "weight_decay": model.params.weight_decay,
+            },
+            # No weight decay for less than 2D parameters tensors (bias, LayerNorm, etc.)
+            {
+                "params": [
+                    param for param in trainable_params.values() if param.dim() < 2
+                ],
+                "weight_decay": 0.0,
+            },
+        ],
+        lr=model.params.learning_rate,
+        fused=True,
+    )
+
+    # Training loop
+    for step, data in enumerate(dataloader):
+        x = data["x"].to(device)
+        y = data["y"].to(device)
+
+        with torch.autocast(device.type, dtype=torch.bfloat16):
+            out, aux_loss = model(x)
+
+            out = einops.rearrange(out, "batch seq_len probs -> (batch seq_len) probs")
+            y = einops.rearrange(y, "batch seq_len -> (batch seq_len)")
+
+            loss = 0.9 * F.cross_entropy(out, y) + 0.1 * aux_loss
+
+            yield {
+                "step": step,
+                "loss": loss.item(),
+                "aux_loss": aux_loss.item(),
+            }
+
+            loss = loss / model.params.grad_accumulation_steps
+
+        scaler.scale(loss).backward()
+
+        if (step + 1) % model.params.grad_accumulation_steps == 0:
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
+            # TODO: Grokfast?
+
+            # Learning rate schedule
+            lr = _lr_schedule(step)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
+
+            scaler.step(optimizer)
+            scaler.update()
             optimizer.zero_grad()
 
 
@@ -474,9 +535,30 @@ def infer(model: Pico, text: str, params: PicoHyperparameters):
 def train_command():
     params = PicoHyperparameters()
     model = Pico(params)
-    model = model.bfloat16().cuda()
-    infer(model, "T", params)
-    train(model, params)
+    model = torch.compile(model)
+
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"Model has {param_count} parameters")
+
+    def read_file(file):
+        with open(file, "r") as f:
+            for line in f:
+                yield {"text": line}
+
+    dataset = IterableDataset.from_generator(
+        read_file, gen_kwargs={"file": "data/wikitext-103-v1-train.txt"}
+    )
+
+    tm1 = time.time()
+    for step in train(model, dataset):
+        print(step)
+        tm2 = time.time()
+
+        byte_per_sec = params.batch_size * params.context_len / (tm2 - tm1)
+
+        print(f"Time: {tm2 - tm1}, Byte/sec: {byte_per_sec}")
+        tm1 = tm2
+
     while True:
         print("\n\n----------------- INFERENCE -----------------\n\n")
         infer(model, "T", params)
