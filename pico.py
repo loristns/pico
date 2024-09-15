@@ -201,8 +201,8 @@ class MoDBlockSeq(BlockSeq):
         seq_len = x.shape[1]
 
         # [batch, seq_len, 1]
-        router_weights_logits = self.router(x)
-        router_weights = F.sigmoid(router_weights_logits)
+        router_weights = self.router(x)
+        router_weights = F.sigmoid(router_weights)
 
         # Capacity is the number of elements to keep in the resampled sequence
         if self.training:
@@ -226,9 +226,6 @@ class MoDBlockSeq(BlockSeq):
         # Keep original sequence order
         router_top_indices, router_top_order = torch.sort(router_top_indices, dim=1)
         router_top_weights = torch.gather(router_weights, dim=1, index=router_top_order)
-        router_top_weights = (
-            router_top_weights - self.router_shift
-        ) * self.router_scale
 
         # Expand indices over each dimensions for gather/scatter operations
         router_top_indices_exp = einops.repeat(
@@ -242,35 +239,41 @@ class MoDBlockSeq(BlockSeq):
         # Apply blocks
         mod_x = super().forward(mod_x)
 
+        # Scale and shift router weights
+        # TODO: useful?
+        router_top_weights = (
+            router_top_weights - self.router_shift
+        ) * self.router_scale
+
         # Apply router weights
         mod_x = mod_x * router_top_weights
 
         # Scatter back to original sequence (filling the rest with zeros)
         # [batch, seq_len, dim]
-        out = torch.scatter(
+        pred = torch.scatter(
             torch.zeros_like(x),
             dim=1,
             index=router_top_indices_exp,
             src=mod_x,
         )
 
-        # Mixture-of-Depth auxiliary loss
-        mod_loss = F.binary_cross_entropy_with_logits(
-            router_weights_logits,
-            torch.scatter(
-                torch.zeros_like(router_weights),
-                dim=1,
-                index=router_top_indices,
-                src=torch.ones_like(router_weights),
-            ),
+        # During training: ground truth for Mixtures-of-Depth auxiliary loss
+        # During inference: binary vector for router decisions
+        router_decisions = torch.scatter(
+            torch.zeros_like(router_weights),
+            dim=1,
+            index=router_top_indices,
+            src=torch.ones_like(router_weights),
         )
 
-        return out, mod_loss
+        return pred, router_weights, router_decisions
 
 
 ########################
 #   Model definition   #
 ########################
+
+
 @dataclass
 class PicoHyperparameters:
     # Model hyperparameters
@@ -333,19 +336,21 @@ class Pico(nn.Module):
         x = self.embedding(x)
 
         x = self.fb_in(x)
-        mod_out, aux_loss = self.mod(x)
-        x = x + mod_out
+        mod_pred, mod_weights, mod_decisions = self.mod(x)
+        x = x + mod_pred
         x = self.fb_out(x)
 
         x = self.norm(x)
         x = x @ self.embedding.weight.T
 
-        return x, aux_loss
+        return x, mod_weights, mod_decisions
 
 
 #####################
 #   Serialization   #
 #####################
+
+
 def save(model: Pico, path: Union[pathlib.Path, str], checkpoint: bool = False):
     path = pathlib.Path(path)
     path.mkdir(parents=True, exist_ok=True)
@@ -397,7 +402,9 @@ def load(path: Union[pathlib.Path, str], checkpoint: int = -1):
 
 
 def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
+    # ---
     # Utility functions
+    # ---
     def _processing(batch: Dict[str, list[str]]):
         chunks = []
         current_buffer = []
@@ -444,7 +451,25 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
         coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
         return 0.1 * learning_rate + coeff * 0.9 * learning_rate
 
+    @torch.compile
+    def _loss(pred, mod_weights, mod_decisions, y):
+        pred = einops.rearrange(pred, "batch seq_len probs -> (batch seq_len) probs")
+        mod_weights = einops.rearrange(
+            mod_weights, "batch seq_len 1 -> (batch seq_len)"
+        )
+        mod_decisions = einops.rearrange(
+            mod_decisions, "batch seq_len 1 -> (batch seq_len)"
+        )
+        y = einops.rearrange(y, "batch seq_len -> (batch seq_len)")
+
+        aux_loss = F.binary_cross_entropy(mod_weights, mod_decisions)
+        loss = 0.9 * F.cross_entropy(pred, y) + 0.1 * aux_loss
+
+        return loss, aux_loss
+
+    # ---
     # Configure training
+    # ---
     device = torch.device("cuda")
 
     model.train()
@@ -482,26 +507,25 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
         fused=True,
     )
 
+    # ---
     # Training loop
+    # ---
     for step, data in enumerate(dataloader):
         x = data["x"].to(device)
         y = data["y"].to(device)
 
         with torch.autocast(device.type, dtype=torch.bfloat16):
-            out, aux_loss = model(x)
+            pred, mod_weights, mod_decisions = model(x)
 
-            out = einops.rearrange(out, "batch seq_len probs -> (batch seq_len) probs")
-            y = einops.rearrange(y, "batch seq_len -> (batch seq_len)")
+        loss, aux_loss = _loss(pred, mod_weights, mod_decisions, y)
 
-            loss = 0.9 * F.cross_entropy(out, y) + 0.1 * aux_loss
+        yield {
+            "step": step,
+            "loss": loss.item(),
+            "aux_loss": aux_loss.item(),
+        }
 
-            yield {
-                "step": step,
-                "loss": loss.item(),
-                "aux_loss": aux_loss.item(),
-            }
-
-            loss = loss / model.params.grad_accumulation_steps
+        loss = loss / model.params.grad_accumulation_steps
 
         scaler.scale(loss).backward()
 
@@ -510,7 +534,7 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             # TODO: Grokfast?
 
-            # Learning rate schedule
+            # Apply learning rate schedule before optimizer step
             lr = _lr_schedule(step)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
