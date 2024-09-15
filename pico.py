@@ -31,6 +31,8 @@ app = typer.Typer(pretty_exceptions_enable=False)
 #######################
 #   Building blocks   #
 #######################
+
+
 class GQA(nn.Module):
     def __init__(
         self,
@@ -58,7 +60,7 @@ class GQA(nn.Module):
         self.alibi_slopes = torch.exp2(-((self.alibi_slopes + 1) * 8.0 / q_heads))
         self.alibi_slopes = self.alibi_slopes.cuda()
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, kv_cache: Optional[torch.Tensor] = None):
         qkv = self.fused_qkv(x)
         qkv = einops.rearrange(
             qkv,
@@ -71,6 +73,17 @@ class GQA(nn.Module):
         # k: [batch, seq_len, kv_heads, head_dim]
         # v: [batch, seq_len, kv_heads, head_dim]
         q, k, v = torch.split(qkv, [self.q_heads, self.kv_heads, self.kv_heads], dim=2)
+
+        # Concatenate cached key and value heads (if available)
+        if kv_cache is not None:
+            k_cache, v_cache = torch.split(
+                kv_cache, [self.kv_heads, self.kv_heads], dim=2
+            )
+            k = torch.cat([k_cache, k], dim=1)
+            v = torch.cat([v_cache, v], dim=1)
+
+        # Update KV cache ([batch, seq_len, kv_heads*2, head_dim])
+        kv_cache = torch.cat([k, v], dim=2)
 
         att = flash_attn_func(
             q,
@@ -86,7 +99,7 @@ class GQA(nn.Module):
         )
 
         out = self.proj(att)
-        return out
+        return out, kv_cache
 
 
 class SwiGLU(nn.Module):
@@ -125,10 +138,12 @@ class Block(nn.Module):
         self.att = GQA(dim, att_q_heads, att_kv_heads, att_window_size, dropout)
         self.glu = SwiGLU(dim, dropout)
 
-    def forward(self, x: torch.Tensor):
-        x = x + self.att(self.norm1(x))
+    def forward(self, x: torch.Tensor, kv_cache: Optional[torch.Tensor] = None):
+        att, kv_cache = self.att(self.norm1(x), kv_cache)
+
+        x = x + att
         x = x + self.glu(self.norm2(x))
-        return x
+        return x, kv_cache
 
 
 class BlockSeq(nn.Module):
@@ -149,7 +164,7 @@ class BlockSeq(nn.Module):
 
     def forward(self, x: torch.Tensor):
         for block in self.blocks:
-            x = block(x)
+            x, _ = block(x)  # TODO: handle kv_cache
 
         return x
 
