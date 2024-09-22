@@ -39,8 +39,8 @@ class GQA(nn.Module):
         dim: int,
         q_heads: int,
         kv_heads: int,
-        window_size: Optional[int] = None,
-        dropout: float = 0.1,
+        window_size: int,
+        dropout: float,
     ):
         super().__init__()
 
@@ -60,7 +60,7 @@ class GQA(nn.Module):
         self.alibi_slopes = torch.exp2(-((self.alibi_slopes + 1) * 8.0 / q_heads))
         self.alibi_slopes = self.alibi_slopes.cuda()
 
-    def forward(self, x: torch.Tensor, kv_cache: Optional[torch.Tensor] = None):
+    def forward(self, x: torch.Tensor):
         qkv = self.fused_qkv(x)
         qkv = einops.rearrange(
             qkv,
@@ -74,17 +74,6 @@ class GQA(nn.Module):
         # v: [batch, seq_len, kv_heads, head_dim]
         q, k, v = torch.split(qkv, [self.q_heads, self.kv_heads, self.kv_heads], dim=2)
 
-        # Concatenate cached key and value heads (if available)
-        if kv_cache is not None:
-            k_cache, v_cache = torch.split(
-                kv_cache, [self.kv_heads, self.kv_heads], dim=2
-            )
-            k = torch.cat([k_cache, k], dim=1)
-            v = torch.cat([v_cache, v], dim=1)
-
-        # Update KV cache ([batch, seq_len, kv_heads*2, head_dim])
-        kv_cache = torch.cat([k, v], dim=2)
-
         att = flash_attn_func(
             q,
             k,
@@ -92,14 +81,15 @@ class GQA(nn.Module):
             causal=True,
             window_size=(self.window_size, self.window_size),
             alibi_slopes=self.alibi_slopes,
-            dropout_p=self.dropout,
+            dropout_p=self.dropout if self.training else 0.0,
         )
+
         att = einops.rearrange(
             att, "batch seq_len q_heads head_dim -> batch seq_len (q_heads head_dim)"
         )
-
         out = self.proj(att)
-        return out, kv_cache
+
+        return out
 
 
 class SwiGLU(nn.Module):
@@ -127,8 +117,8 @@ class Block(nn.Module):
         dim: int,
         att_q_heads: int,
         att_kv_heads: int,
-        att_window_size: Optional[int] = None,
-        dropout: float = 0.1,
+        att_window_size: int,
+        dropout: float,
     ):
         super().__init__()
 
@@ -138,12 +128,11 @@ class Block(nn.Module):
         self.att = GQA(dim, att_q_heads, att_kv_heads, att_window_size, dropout)
         self.glu = SwiGLU(dim, dropout)
 
-    def forward(self, x: torch.Tensor, kv_cache: Optional[torch.Tensor] = None):
-        att, kv_cache = self.att(self.norm1(x), kv_cache)
-
-        x = x + att
+    def forward(self, x: torch.Tensor):
+        x = x + self.att(self.norm1(x))
         x = x + self.glu(self.norm2(x))
-        return x, kv_cache
+
+        return x
 
 
 class BlockSeq(nn.Module):
@@ -153,8 +142,8 @@ class BlockSeq(nn.Module):
         dim: int,
         att_q_heads: int,
         att_kv_heads: int,
-        att_window_size: Optional[int] = None,
-        dropout: float = 0.1,
+        att_window_size: int,
+        dropout: float,
     ):
         super().__init__()
         self.blocks = nn.ModuleList(
@@ -164,7 +153,7 @@ class BlockSeq(nn.Module):
 
     def forward(self, x: torch.Tensor):
         for block in self.blocks:
-            x, _ = block(x)  # TODO: handle kv_cache
+            x = block(x)
 
         return x
 
@@ -177,8 +166,8 @@ class MoDBlockSeq(BlockSeq):
         dim: int,
         att_q_heads: int,
         att_kv_heads: int,
-        att_window_size: Optional[int] = None,
-        dropout: float = 0.1,
+        att_window_size: int,
+        dropout: float,
     ):
         super().__init__(
             num_blocks,
@@ -216,7 +205,11 @@ class MoDBlockSeq(BlockSeq):
 
         # Skip computations if capacity is 0
         if capacity == 0:
-            return torch.zeros_like(x), torch.tensor(0.0)
+            return (
+                torch.zeros_like(x),
+                router_weights,
+                torch.zeros_like(router_weights),
+            )
 
         # [batch, capacity, 1]
         router_top_weights, router_top_indices = torch.topk(
@@ -277,26 +270,26 @@ class MoDBlockSeq(BlockSeq):
 @dataclass
 class PicoHyperparameters:
     # Model hyperparameters
-    dim: int = 384
+    dim: int = 128
     att_q_heads = 9
     att_kv_heads = 3
 
     # - Full bytes blocks (FB)
     fb_num_blocks: int = 2
-    fb_att_window_size: int = 8
+    fb_att_window_size: int = 16
 
     # - Mixture of Depth blocks (MoD)
-    mod_num_blocks: int = 16
+    mod_num_blocks: int = 1
     mod_att_window_size: int = 512
-    mod_capacity_factor: float = 0.125
+    mod_capacity_factor: float = 0.25
 
     # Train hyperparameters
-    context_len: int = 8 * 1024
-    batch_size: int = 8
-    grad_accumulation_steps: int = 16
+    context_len: int = 6 * 1024
+    batch_size: int = 32
+    grad_accumulation_steps: int = 1
     learning_rate: float = 1e-3
     warmup_steps: int = 100
-    max_steps: int = 5000
+    max_steps: int = 2700
     weight_decay: float = 0.1
     dropout: float = 0.2
 
@@ -336,8 +329,10 @@ class Pico(nn.Module):
         x = self.embedding(x)
 
         x = self.fb_in(x)
+
         mod_pred, mod_weights, mod_decisions = self.mod(x)
         x = x + mod_pred
+
         x = self.fb_out(x)
 
         x = self.norm(x)
@@ -370,7 +365,10 @@ def save(model: Pico, path: Union[pathlib.Path, str], checkpoint: bool = False):
         model_path.rename(checkpoint_path)
 
     # Save model and hyperparameters
-    save_file(model.state_dict(), model_path)
+    if hasattr(model, "_orig_mod"):
+        save_file(model._orig_mod.state_dict(), model_path)
+    else:
+        save_file(model.state_dict(), model_path)
 
     if not hyperparams_path.exists() or not checkpoint:
         with open(hyperparams_path, "w") as f:
@@ -405,7 +403,7 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
     # ---
     # Utility functions
     # ---
-    def _processing(batch: Dict[str, list[str]]):
+    def _processing(batch: Dict[str, list[bytes]]):
         chunks = []
         current_buffer = []
 
@@ -415,11 +413,9 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
         eot_seq = list(model.params.eot_seq.encode("utf-8"))
         eot_seq_len = len(eot_seq)
 
-        for text in batch["text"]:
-            tokens = text.encode("utf-8")
-
+        for bytes in batch["bytes"]:
             current_buffer.extend(eot_seq)
-            current_buffer.extend(tokens)
+            current_buffer.extend(bytes)
 
             # Split the buffer into chunks of window_len
             while len(current_buffer) >= window_len:
@@ -476,7 +472,7 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
     model.to(device)
 
     dataloader = DataLoader(
-        dataset.map(_processing, batched=True, remove_columns=["text"]).with_format(
+        dataset.map(_processing, batched=True, remove_columns=["bytes"]).with_format(
             "numpy"
         ),
         batch_size=model.params.batch_size,
@@ -532,7 +528,6 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
         if (step + 1) % model.params.grad_accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            # TODO: Grokfast?
 
             # Apply learning rate schedule before optimizer step
             lr = _lr_schedule(step)
@@ -544,29 +539,56 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
             optimizer.zero_grad()
 
 
-# Inference function
-def infer(model: Pico, text: str, params: PicoHyperparameters):
-    with torch.device("cuda" if torch.cuda.is_available() else "cpu"):
-        with torch.no_grad():
-            model.eval()
-            x = torch.tensor([ord(c) for c in text], dtype=torch.long)
-            x = x.unsqueeze(0).to("cuda")
+#################
+#   Inference   #
+#################
 
-            i = len(text)
 
-            print(text, end="", flush=True)
+def infer(
+    model: Pico,
+    prompt: Optional[bytes] = None,
+    temperature: float = 1.0,
+    max_iteration: int = -1,
+    stop_at_eot: bool = True,
+):
+    device = torch.device("cuda")
 
-            while i < params.context_len:
-                out, _ = model(x)
-                out = out[:, i - 1, :]
+    model.eval()
+    model.to(device)
 
-                out = F.softmax(out, dim=-1)
+    if prompt is None:
+        prompt = model.params.eot_seq.encode("utf-8")
 
-                next_char = torch.multinomial(out, 1)
-                x = torch.cat([x, next_char], dim=1)
-                i += 1
+    init_seq = torch.tensor([*prompt], dtype=torch.long).unsqueeze(0).to(device)
+    seq = init_seq
+    iteration = 0
 
-                print(chr(next_char.item()), end="", flush=True)
+    while True:
+        with torch.autocast(device.type, dtype=torch.bfloat16):
+            pred, mod_weights, mod_decisions = model(seq)
+
+        pred = F.softmax(pred[:, -1, :] * temperature, dim=-1)
+        pred = torch.multinomial(pred, 1)
+
+        mod = mod_decisions[:, -1].item()
+
+        seq = torch.cat([seq, pred], dim=1)
+
+        iteration += 1
+        byte_seq = bytes(seq.squeeze(0).cpu().tolist())
+        yield {
+            "iteration": iteration,
+            "byte": pred.item(),
+            "seq": byte_seq,
+            "mod": mod == 1,
+            "mod_weights": mod_weights[:, -1, :].item(),
+        }
+
+        if max_iteration > 0 and iteration >= max_iteration:
+            break
+
+        if stop_at_eot and byte_seq.endswith(model.params.eot_seq.encode("utf-8")):
+            break
 
 
 # CLI
@@ -574,33 +596,45 @@ def infer(model: Pico, text: str, params: PicoHyperparameters):
 def train_command():
     params = PicoHyperparameters()
     model = Pico(params)
-    model = torch.compile(model)
 
     param_count = sum(p.numel() for p in model.parameters())
     print(f"Model has {param_count} parameters")
 
+    model = torch.compile(model)
+
     def read_file(file):
         with open(file, "r") as f:
             for line in f:
-                yield {"text": line}
+                yield {"bytes": line.encode("utf-8")}
 
     dataset = IterableDataset.from_generator(
         read_file, gen_kwargs={"file": "data/wikitext-103-v1-train.txt"}
     )
 
     tm1 = time.time()
-    for step in train(model, dataset):
-        print(step)
-        tm2 = time.time()
+    for epoch in range(2):
+        for step in train(model, dataset):
+            print(step)
+            tm2 = time.time()
 
-        byte_per_sec = params.batch_size * params.context_len / (tm2 - tm1)
+            byte_per_sec = params.batch_size * params.context_len / (tm2 - tm1)
 
-        print(f"Time: {tm2 - tm1}, Byte/sec: {byte_per_sec}")
-        tm1 = tm2
+            print(f"Time: {tm2 - tm1}, Byte/sec: {byte_per_sec}")
+            tm1 = tm2
 
-    while True:
-        print("\n\n----------------- INFERENCE -----------------\n\n")
-        infer(model, "T", params)
+            if step["step"] % 250 == 0:
+                save(model, "./test-wikitext-103", checkpoint=True)
+
+        save(model, "./test-wikitext-103", checkpoint=True)
+
+
+@app.command("test")
+def test():
+    model = load("./test-wikitext-103")
+    for iteration in infer(model, temperature=1.5, stop_at_eot=False):
+        # if iteration["mod"]:
+        #    print("_", end="", flush=True)
+        print(chr(iteration["byte"]), end="", flush=True)
 
 
 if __name__ == "__main__":
