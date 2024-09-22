@@ -15,7 +15,7 @@ def infer(
     prompt: Optional[bytes] = None,
     temperature: float = 1.0,
     max_iteration: int = -1,
-    stop_at_eot: bool = True,
+    stop_end_seq: bool = True,
 ):
     device = torch.device("cuda")
 
@@ -23,7 +23,7 @@ def infer(
     model.to(device)
 
     if prompt is None:
-        prompt = model.params.eot_seq.encode("utf-8")
+        prompt = model.params.start_seq.encode("utf-8")
 
     init_seq = torch.tensor([*prompt], dtype=torch.long).unsqueeze(0).to(device)
     seq = init_seq
@@ -53,5 +53,5 @@ def infer(
         if max_iteration > 0 and iteration >= max_iteration:
             break
 
-        if stop_at_eot and byte_seq.endswith(model.params.eot_seq.encode("utf-8")):
+        if stop_end_seq and byte_seq.endswith(model.params.end_seq.encode("utf-8")):
             break

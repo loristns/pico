@@ -31,14 +31,15 @@ class PicoHyperparameters:
     context_len: int = 6 * 1024
     batch_size: int = 32
     grad_accumulation_steps: int = 1
-    learning_rate: float = 1e-3
-    warmup_steps: int = 100
+    learning_rate: float = 6e-4
+    warmup_steps: int = 150
     max_steps: int = 2700
     weight_decay: float = 0.1
     dropout: float = 0.2
 
     # Special sequences
-    eot_seq: str = "<|eot|>"
+    start_seq: str = "<pico:seq>"
+    end_seq: str = "</pico:seq>"
 
 
 #######################

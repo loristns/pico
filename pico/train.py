@@ -19,11 +19,13 @@ def format_dataset(
 
         window_len = params.context_len + 1
 
-        eot_seq = list(params.eot_seq.encode("utf-8"))
-        eot_seq_len = len(eot_seq)
+        start_seq = list(params.start_seq.encode("utf-8"))
+        end_seq = list(params.end_seq.encode("utf-8"))
+
+        doc_separation_seq_len = len(start_seq) + len(end_seq)
 
         for bytes in batch["bytes"]:
-            current_buffer.extend(eot_seq)
+            current_buffer.extend(start_seq)
             current_buffer.extend(bytes)
 
             # Split the buffer into chunks of window_len
@@ -32,17 +34,22 @@ def format_dataset(
                 chunks.append(chunk)
                 current_buffer = current_buffer[window_len:]
 
-            # Handle the case where appending eot_seq would exceed the window_len
-            while len(current_buffer) + eot_seq_len > window_len:
-                current_buffer = current_buffer[eot_seq_len - 1 :]  # Drop prefix
+            # Handle the edge case where appending the end sequence + start sequence would exceed the window length
+            while len(current_buffer) + doc_separation_seq_len > window_len:
+                # Drop prefix
+                current_buffer = current_buffer[doc_separation_seq_len - 1 :]
+
+            current_buffer.extend(end_seq)
 
         return {
             "x": torch.tensor(chunks)[:, :-1],
             "y": torch.tensor(chunks)[:, 1:],
         }
 
-    return dataset.map(_preprocess, batched=True, remove_columns=["bytes"]).with_format(
-        "numpy"
+    return (
+        dataset.shuffle()
+        .map(_preprocess, batched=True, remove_columns=["bytes"])
+        .with_format("numpy")
     )
 
 
@@ -112,7 +119,7 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
                 ],
                 "weight_decay": model.params.weight_decay,
             },
-            # No weight decay for less than 2D parameters tensors (bias, LayerNorm, etc.)
+            # No weight decay for less than 2D parameters tensors (bias, RMSNorm, etc.)
             {
                 "params": [
                     param for param in trainable_params.values() if param.dim() < 2

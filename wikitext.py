@@ -41,8 +41,15 @@ def run_training():
 
     def read_file(file):
         with open(file, "r") as f:
+            document = ""
+
             for line in f:
-                yield {"bytes": line.encode("utf-8")}
+                if (line.startswith(" = ") and not line.startswith(" = =")):
+                    if document:
+                        yield {"bytes": document.encode("utf-8")}
+                    document = ""
+
+                document += line
 
     dataset = IterableDataset.from_generator(
         read_file, gen_kwargs={"file": "data/wikitext-103-v1-train.txt"}
@@ -59,7 +66,7 @@ def run_training():
             print(f"Time: {tm2 - tm1}, Byte/sec: {byte_per_sec}")
             tm1 = tm2
 
-            if step["step"] % 250 == 0:
+            if step["step"] % 500 == 0:
                 save(model, "./models/test-wikitext-103", checkpoint=True)
 
         save(model, "./models/test-wikitext-103", checkpoint=True)
@@ -74,7 +81,7 @@ def run_inference(
 ):
     print("Testing on wikitext-103")
 
-    model = load("./models/test-wikitext-103-v1", checkpoint)
+    model = load("./models/test-wikitext-103", checkpoint)
 
     if prompt is not None:
         print(prompt, end="", flush=True)
@@ -83,7 +90,7 @@ def run_inference(
         model,
         prompt=prompt.encode("utf-8") if prompt is not None else None,
         temperature=temperature,
-        stop_at_eot=False,
+        stop_end_seq=False,
     ):
         if show_mod and iteration["mod"]:
             print("_", end="", flush=True)
