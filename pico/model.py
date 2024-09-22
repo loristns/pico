@@ -135,8 +135,8 @@ class Block(nn.Module):
     ):
         super().__init__()
 
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
+        self.norm1 = nn.RMSNorm(dim)
+        self.norm2 = nn.RMSNorm(dim)
 
         self.att = GQA(dim, att_q_heads, att_kv_heads, att_window_size, dropout)
         self.glu = SwiGLU(dim, dropout)
@@ -306,7 +306,7 @@ class Pico(nn.Module):
         self.mod = MoDBlockSeq(**mod_params)
         self.fb_out = BlockSeq(**fb_params)
 
-        self.norm = nn.LayerNorm(params.dim)
+        self.norm = nn.RMSNorm(params.dim)
 
     def forward(self, x: torch.Tensor):
         x = self.embedding(x)
