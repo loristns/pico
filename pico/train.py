@@ -17,7 +17,7 @@ def format_dataset(
         chunks = []
         current_buffer = []
 
-        window_len = params.context_len + 1
+        window_len = params.context_len + params.next_tokens
 
         start_seq = list(params.start_seq.encode("utf-8"))
         end_seq = list(params.end_seq.encode("utf-8"))
@@ -41,9 +41,17 @@ def format_dataset(
 
             current_buffer.extend(end_seq)
 
+        chunks = torch.tensor(chunks)
+
         return {
-            "x": torch.tensor(chunks)[:, :-1],
-            "y": torch.tensor(chunks)[:, 1:],
+            "x": chunks[:, : -params.next_tokens],
+            "y": torch.stack(
+                [
+                    chunks[:, i : params.context_len + i]
+                    for i in range(1, params.next_tokens + 1)
+                ],
+                dim=-1,
+            ),
         }
 
     return (
@@ -74,19 +82,52 @@ def loss_fn(
     mod_decisions: torch.Tensor,
     targets: torch.Tensor,
 ):
-    predictions = einops.rearrange(
-        predictions, "batch seq_len probs -> (batch seq_len) probs"
+    _, seq_len, next_tokens, _ = predictions.shape
+
+    # Golden ratio
+    phi = 1.618
+    # Expected sum of phi^0 + phi^1 + ... + phi^(next_tokens - 1)
+    geometric_sum = (phi**next_tokens - 1) / (phi - 1)
+    # Weight token heads loss more heavily for immediate next tokens than for later ones
+    token_weights = (
+        phi ** (next_tokens - torch.arange(next_tokens, device=predictions.device) - 1)
+    ) / geometric_sum
+
+    flat_predictions = einops.rearrange(
+        predictions,
+        "batch seq_len next_tokens probs -> (batch seq_len next_tokens) probs",
     )
+    flat_targets = einops.rearrange(
+        targets, "batch seq_len next_tokens -> (batch seq_len next_tokens)"
+    )
+    lm_losses = einops.rearrange(
+        F.cross_entropy(flat_predictions, flat_targets, reduction="none"),
+        "(batch seq_len next_tokens) -> batch seq_len next_tokens",
+        seq_len=seq_len,
+        next_tokens=next_tokens,
+    )
+
+    lm_loss = (
+        (
+            lm_losses * token_weights  # Weighted loss
+        )
+        .sum(dim=-1)  # Sum over next_tokens
+        .mean()  # Average over batch/seq_len
+    )
+
+    # Also return next token loss for logging purposes
+    next_token_lm_loss = lm_losses[:, :, 0]
+    next_token_lm_loss = next_token_lm_loss.mean()
+
     mod_weights = einops.rearrange(mod_weights, "batch seq_len 1 -> (batch seq_len)")
     mod_decisions = einops.rearrange(
         mod_decisions, "batch seq_len 1 -> (batch seq_len)"
     )
-    targets = einops.rearrange(targets, "batch seq_len -> (batch seq_len)")
 
     aux_loss = F.binary_cross_entropy(mod_weights, mod_decisions)
-    loss = 0.9 * F.cross_entropy(predictions, targets) + 0.1 * aux_loss
 
-    return loss, aux_loss
+    lm_loss = 0.9 * lm_loss + 0.1 * aux_loss
+    return lm_loss, aux_loss, next_token_lm_loss
 
 
 ################
@@ -139,11 +180,14 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
         with torch.autocast(device.type, dtype=torch.bfloat16):
             pred, mod_weights, mod_decisions = model(x)
 
-        loss, aux_loss = loss_fn(pred, mod_weights, mod_decisions, y)
+        loss, aux_loss, next_token_lm_loss = loss_fn(
+            pred, mod_weights, mod_decisions, y
+        )
 
         yield {
             "step": step,
             "loss": loss.item(),
+            "next_token_lm_loss": next_token_lm_loss.item(),
             "aux_loss": aux_loss.item(),
         }
 

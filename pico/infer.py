@@ -33,7 +33,7 @@ def infer(
         with torch.autocast(device.type, dtype=torch.bfloat16):
             pred, mod_weights, mod_decisions = model(seq)
 
-        pred = F.softmax(pred[:, -1, :] * temperature, dim=-1)
+        pred = F.softmax(pred[:, -1, 0, :] * temperature, dim=-1)
         pred = torch.multinomial(pred, 1)
 
         mod = mod_decisions[:, -1].item()

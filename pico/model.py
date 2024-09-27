@@ -15,8 +15,9 @@ from torch.nn import functional as F
 class PicoHyperparameters:
     # Model hyperparameters
     dim: int = 128
-    att_q_heads = 9
-    att_kv_heads = 3
+    next_tokens: int = 8
+    att_q_heads: int = 9
+    att_kv_heads: int = 3
 
     # - Full bytes blocks (FB)
     fb_num_blocks: int = 2
@@ -29,11 +30,11 @@ class PicoHyperparameters:
 
     # Train hyperparameters
     context_len: int = 6 * 1024
-    batch_size: int = 32
+    batch_size: int = 24
     grad_accumulation_steps: int = 1
-    learning_rate: float = 6e-4
+    learning_rate: float = 1e-3
     warmup_steps: int = 150
-    max_steps: int = 2700
+    max_steps: int = 3600
     weight_decay: float = 0.1
     dropout: float = 0.2
 
@@ -287,6 +288,7 @@ class Pico(nn.Module):
         self.params = params
 
         self.embedding = nn.Embedding(256, params.dim)
+        self.unembedding = nn.Linear(params.dim, 256 * params.next_tokens)
 
         fb_params = {
             "num_blocks": params.fb_num_blocks,
@@ -320,6 +322,12 @@ class Pico(nn.Module):
         x = self.fb_out(x)
 
         x = self.norm(x)
-        x = x @ self.embedding.weight.T
+        x = self.unembedding(x)
+
+        x = einops.rearrange(
+            x,
+            "batch seq_len (next_tokens probs) -> batch seq_len next_tokens probs",
+            next_tokens=self.params.next_tokens,
+        )
 
         return x, mod_weights, mod_decisions
