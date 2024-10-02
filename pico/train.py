@@ -41,18 +41,17 @@ def format_dataset(
 
             current_buffer.extend(end_seq)
 
-        chunks = torch.tensor(chunks)
+        chunks = torch.tensor(chunks).unfold(1, params.context_len, 1)
+        chunks = einops.rearrange(
+            chunks, "batch next_tokens seq_len -> batch seq_len next_tokens"
+        )
 
-        return {
-            "x": chunks[:, : -params.next_tokens],
-            "y": torch.stack(
-                [
-                    chunks[:, i : params.context_len + i]
-                    for i in range(1, params.next_tokens + 1)
-                ],
-                dim=-1,
-            ),
+        results = {
+            "x": chunks[:, :, 0],
+            "y": chunks[:, :, 1:],
         }
+
+        return results
 
     return (
         dataset.shuffle()
@@ -145,6 +144,7 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
     dataloader = DataLoader(
         format_dataset(dataset, model.params),
         batch_size=model.params.batch_size,
+        pin_memory=True,
     )
 
     trainable_params = {
@@ -174,8 +174,8 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
 
     # Training loop
     for step, data in enumerate(dataloader):
-        x = data["x"].to(device)
-        y = data["y"].to(device)
+        x = data["x"].to(device, non_blocking=True)
+        y = data["y"].to(device, non_blocking=True)
 
         with torch.autocast(device.type, dtype=torch.bfloat16):
             pred, mod_weights, mod_decisions = model(x)
