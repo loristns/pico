@@ -1,4 +1,3 @@
-__pycache__/*
-pico/*
-wandb/*
-tensorboard/*
+data/*
+models/*
+__pycache__
