@@ -3,6 +3,7 @@ from typing import Dict, Union
 
 import einops
 import torch
+from accelerate import Accelerator
 from datasets import Dataset, IterableDataset
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
@@ -136,7 +137,8 @@ def loss_fn(
 
 def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
     # Configure training
-    device = torch.device("cuda")
+    accelerator = Accelerator()
+    device = accelerator.device
 
     model.train()
     model.to(device)
@@ -172,10 +174,14 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
         fused=True,
     )
 
+    model, optimizer, dataloader = accelerator.prepare(
+        model, optimizer, dataloader
+    )
+
     # Training loop
     for step, data in enumerate(dataloader):
-        x = data["x"].to(device, non_blocking=True)
-        y = data["y"].to(device, non_blocking=True)
+        x = data["x"]
+        y = data["y"]
 
         with torch.autocast(device.type, dtype=torch.bfloat16):
             pred, mod_weights, mod_decisions = model(x)
@@ -193,7 +199,9 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
 
         loss = loss / model.params.grad_accumulation_steps
 
-        scaler.scale(loss).backward()
+        accelerator.backward(
+            scaler.scale(loss),
+        )
 
         if (step + 1) % model.params.grad_accumulation_steps == 0:
             scaler.unscale_(optimizer)
