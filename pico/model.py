@@ -18,15 +18,16 @@ class PicoHyperparameters:
     next_tokens: int = 8
     att_q_heads: int = 9
     att_kv_heads: int = 3
+    att_dropout: float = 0.2
 
     # - Full bytes blocks (FB)
-    fb_num_blocks: int = 2
+    fb_num_blocks: int = 2 # * 2 (before and after latent blocks)
     fb_att_window_size: int = 16
 
-    # - Mixture of Depth blocks (MoD)
-    mod_num_blocks: int = 12
-    mod_att_window_size: int = 512
-    mod_capacity_factor: float = 0.25
+    # - Latent blocks (MoD)
+    latent_num_blocks: int = 12
+    latent_att_window_size: int = 512
+    latent_capacity_factor: float = 0.25
 
     # Train hyperparameters
     context_len: int = 6 * 1024
@@ -36,7 +37,6 @@ class PicoHyperparameters:
     warmup_steps: int = 150
     max_steps: int = 3600
     weight_decay: float = 0.1
-    dropout: float = 0.2
 
     # Special sequences
     start_seq: str = "<pico:seq>"
@@ -108,11 +108,10 @@ class GQA(nn.Module):
 
 
 class SwiGLU(nn.Module):
-    def __init__(self, dim: int, dropout: float = 0.1):
+    def __init__(self, dim: int):
         super().__init__()
         self.fc1 = nn.Linear(dim, dim * 2, bias=False)
         self.fc2 = nn.Linear(dim, dim, bias=False)
-        self.dropout = nn.Dropout(dropout)
 
     def forward(self, x: torch.Tensor):
         x = self.fc1(x)
@@ -121,8 +120,6 @@ class SwiGLU(nn.Module):
         x = F.silu(gate) * x
 
         x = self.fc2(x)
-        x = self.dropout(x)
-
         return x
 
 
@@ -133,15 +130,15 @@ class Block(nn.Module):
         att_q_heads: int,
         att_kv_heads: int,
         att_window_size: int,
-        dropout: float,
+        att_dropout: float,
     ):
         super().__init__()
 
         self.norm1 = nn.RMSNorm(dim)
         self.norm2 = nn.RMSNorm(dim)
 
-        self.att = GQA(dim, att_q_heads, att_kv_heads, att_window_size, dropout)
-        self.glu = SwiGLU(dim, dropout)
+        self.att = GQA(dim, att_q_heads, att_kv_heads, att_window_size, att_dropout)
+        self.glu = SwiGLU(dim)
 
     def forward(self, x: torch.Tensor):
         x = x + self.att(self.norm1(x))
@@ -158,11 +155,11 @@ class BlockSeq(nn.Module):
         att_q_heads: int,
         att_kv_heads: int,
         att_window_size: int,
-        dropout: float,
+        att_dropout: float,
     ):
         super().__init__()
         self.blocks = nn.ModuleList(
-            Block(dim, att_q_heads, att_kv_heads, att_window_size, dropout)
+            Block(dim, att_q_heads, att_kv_heads, att_window_size, att_dropout)
             for _ in range(num_blocks)
         )
 
@@ -173,7 +170,7 @@ class BlockSeq(nn.Module):
         return x
 
 
-class MoDBlockSeq(BlockSeq):
+class LatentBlockSeq(BlockSeq):
     def __init__(
         self,
         num_blocks: int,
@@ -182,7 +179,7 @@ class MoDBlockSeq(BlockSeq):
         att_q_heads: int,
         att_kv_heads: int,
         att_window_size: int,
-        dropout: float,
+        att_dropout: float,
     ):
         super().__init__(
             num_blocks,
@@ -190,15 +187,13 @@ class MoDBlockSeq(BlockSeq):
             att_q_heads,
             att_kv_heads,
             att_window_size,
-            dropout,
+            att_dropout,
         )
 
         self.dim = dim
         self.capacity_factor = capacity_factor
 
         self.router = nn.Linear(dim, 1, bias=False)
-        self.router_scale = nn.Parameter(torch.tensor(1.0))
-        self.router_shift = nn.Parameter(torch.tensor(0.0))
 
     def forward(self, x: torch.Tensor):
         batch_size = x.shape[0]
@@ -242,19 +237,13 @@ class MoDBlockSeq(BlockSeq):
 
         # Create resampled sequence
         # [batch, capacity, dim]
-        mod_x = torch.gather(x, dim=1, index=router_top_indices_exp)
+        latent_x = torch.gather(x, dim=1, index=router_top_indices_exp)
 
         # Apply blocks
-        mod_x = super().forward(mod_x)
-
-        # Scale and shift router weights
-        # TODO: useful?
-        router_top_weights = (
-            router_top_weights - self.router_shift
-        ) * self.router_scale
+        latent_x = super().forward(latent_x)
 
         # Apply router weights
-        mod_x = mod_x * router_top_weights
+        latent_x = latent_x * router_top_weights
 
         # Scatter back to original sequence (filling the rest with zeros)
         # [batch, seq_len, dim]
@@ -262,7 +251,7 @@ class MoDBlockSeq(BlockSeq):
             torch.zeros_like(x),
             dim=1,
             index=router_top_indices_exp,
-            src=mod_x,
+            src=latent_x,
         )
 
         # During training: ground truth for Mixtures-of-Depth auxiliary loss
@@ -295,18 +284,18 @@ class Pico(nn.Module):
             "dim": params.dim,
             "att_q_heads": params.att_q_heads,
             "att_kv_heads": params.att_kv_heads,
+            "att_dropout": params.att_dropout,
             "att_window_size": params.fb_att_window_size,
-            "dropout": params.dropout,
         }
-        mod_params = {
+        latent_params = {
             **fb_params,
-            "num_blocks": params.mod_num_blocks,
-            "capacity_factor": params.mod_capacity_factor,
-            "att_window_size": params.mod_att_window_size,
+            "num_blocks": params.latent_num_blocks,
+            "capacity_factor": params.latent_capacity_factor,
+            "att_window_size": params.latent_att_window_size,
         }
 
         self.fb_in = BlockSeq(**fb_params)
-        self.mod = MoDBlockSeq(**mod_params)
+        self.latent = LatentBlockSeq(**latent_params)
         self.fb_out = BlockSeq(**fb_params)
 
         self.norm = nn.RMSNorm(params.dim)
@@ -316,8 +305,8 @@ class Pico(nn.Module):
 
         x = self.fb_in(x)
 
-        mod_pred, mod_weights, mod_decisions = self.mod(x)
-        x = x + mod_pred
+        latent_pred, router_weights, router_decisions = self.latent(x)
+        x = x + latent_pred
 
         x = self.fb_out(x)
 
@@ -330,4 +319,4 @@ class Pico(nn.Module):
             next_tokens=self.params.next_tokens,
         )
 
-        return x, mod_weights, mod_decisions
+        return x, router_weights, router_decisions

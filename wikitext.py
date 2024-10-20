@@ -44,7 +44,7 @@ def run_training():
             document = ""
 
             for line in f:
-                if (line.startswith(" = ") and not line.startswith(" = =")):
+                if line.startswith(" = ") and not line.startswith(" = ="):
                     if document:
                         yield {"bytes": document.encode("utf-8")}
                     document = ""
@@ -77,7 +77,7 @@ def run_inference(
     prompt: Optional[str] = None,
     temperature: float = 1.5,
     checkpoint: int = -1,
-    show_mod: bool = False,
+    show_router_decisions: bool = False,
 ):
     print("Testing on wikitext-103")
 
@@ -92,7 +92,7 @@ def run_inference(
         temperature=temperature,
         stop_end_seq=False,
     ):
-        if show_mod and iteration["mod"]:
+        if show_router_decisions and iteration["router_decision"]:
             print("_", end="", flush=True)
 
         print(chr(iteration["byte"]), end="", flush=True)

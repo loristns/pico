@@ -78,8 +78,8 @@ def lr_schedule(step: int, params: PicoHyperparameters):
 @torch.compile
 def loss_fn(
     predictions: torch.Tensor,
-    mod_weights: torch.Tensor,
-    mod_decisions: torch.Tensor,
+    router_weights: torch.Tensor,
+    router_decisions: torch.Tensor,
     targets: torch.Tensor,
 ):
     _, seq_len, next_tokens, _ = predictions.shape
@@ -119,12 +119,12 @@ def loss_fn(
     next_token_lm_loss = lm_losses[:, :, 0]
     next_token_lm_loss = next_token_lm_loss.mean()
 
-    mod_weights = einops.rearrange(mod_weights, "batch seq_len 1 -> (batch seq_len)")
-    mod_decisions = einops.rearrange(
-        mod_decisions, "batch seq_len 1 -> (batch seq_len)"
+    router_weights = einops.rearrange(router_weights, "batch seq_len 1 -> (batch seq_len)")
+    router_decisions = einops.rearrange(
+        router_decisions, "batch seq_len 1 -> (batch seq_len)"
     )
 
-    aux_loss = F.binary_cross_entropy(mod_weights, mod_decisions)
+    aux_loss = F.binary_cross_entropy(router_weights, router_decisions)
 
     lm_loss = 0.9 * lm_loss + 0.1 * aux_loss
     return lm_loss, aux_loss, next_token_lm_loss
@@ -184,10 +184,10 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
         y = data["y"]
 
         with torch.autocast(device.type, dtype=torch.bfloat16):
-            pred, mod_weights, mod_decisions = model(x)
+            pred, router_weights, router_decisions = model(x)
 
         loss, aux_loss, next_token_lm_loss = loss_fn(
-            pred, mod_weights, mod_decisions, y
+            pred, router_weights, router_decisions, y
         )
 
         yield {

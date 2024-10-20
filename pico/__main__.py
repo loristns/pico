@@ -29,7 +29,6 @@ def train_command(
     warmup_steps: Optional[int] = 150,
     max_steps: Optional[int] = 3600,
     weight_decay: Optional[float] = 0.1,
-    dropout: Optional[float] = 0.2,
     # Checkpointing
     checkpoint_path: Optional[str] = None,
     checkpoint_steps: Optional[int] = 500,
@@ -58,9 +57,12 @@ def train_command(
             warmup_steps=warmup_steps,
             max_steps=max_steps,
             weight_decay=weight_decay,
-            dropout=dropout,
         )
         model = Pico(params)
+
+    
+    param_count = sum(p.numel() for p in model.parameters())
+    print(f"🌟 Model has {param_count} parameters")
 
     model = torch.compile(model)
 
@@ -94,7 +96,7 @@ def test_command(
     # Inference hyperparameters
     prompt: Optional[str] = None,
     temperature: Optional[float] = 1.5,
-    show_mod: Optional[bool] = False,
+    show_router_decisions: Optional[bool] = False,
 ):
     model = load(model_path, checkpoint)
 
@@ -109,7 +111,7 @@ def test_command(
         temperature=temperature,
         stop_end_seq=False,
     ):
-        if show_mod and iteration["mod"]:
+        if show_router_decisions and iteration["router_decision"]:
             print("_", end="", flush=True)
 
         try:

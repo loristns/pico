@@ -31,12 +31,12 @@ def infer(
 
     while True:
         with torch.autocast(device.type, dtype=torch.bfloat16):
-            pred, mod_weights, mod_decisions = model(seq)
+            pred, router_weights, router_decisions = model(seq)
 
         pred = F.softmax(pred[:, -1, 0, :] * temperature, dim=-1)
         pred = torch.multinomial(pred, 1)
 
-        mod = mod_decisions[:, -1].item()
+        router_decision = router_decisions[:, -1].item()
 
         seq = torch.cat([seq, pred], dim=1)
 
@@ -46,8 +46,8 @@ def infer(
             "iteration": iteration,
             "byte": pred.item(),
             "seq": byte_seq,
-            "mod": mod == 1,
-            "mod_weights": mod_weights[:, -1, :].item(),
+            "router_decision": router_decision == 1,
+            "router_weight": router_weights[:, -1, :].item(),
         }
 
         if max_iteration > 0 and iteration >= max_iteration:
