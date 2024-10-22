@@ -84,14 +84,14 @@ def loss_fn(
 ):
     _, seq_len, next_tokens, _ = predictions.shape
 
-    # Golden ratio
+    # Weight tokens heads loss more heavily for immediate next tokens than for later ones such that:
+    # - token_weights[head] ~= token_weight[head + 1] + token_weight[head + 2]
+    # - token_weights.sum() = 1
     phi = 1.618
-    # Expected sum of phi^0 + phi^1 + ... + phi^(next_tokens - 1)
-    geometric_sum = (phi**next_tokens - 1) / (phi - 1)
-    # Weight token heads loss more heavily for immediate next tokens than for later ones
-    token_weights = (
-        phi ** (next_tokens - torch.arange(next_tokens, device=predictions.device) - 1)
-    ) / geometric_sum
+    exponents = torch.arange(0, next_tokens, step=1).flip(dims=(0,))
+    token_weights = phi**exponents
+    token_weights /= token_weights.sum()
+    token_weights = token_weights.to(predictions.device)
 
     flat_predictions = einops.rearrange(
         predictions,
@@ -119,7 +119,9 @@ def loss_fn(
     next_token_lm_loss = lm_losses[:, :, 0]
     next_token_lm_loss = next_token_lm_loss.mean()
 
-    router_weights = einops.rearrange(router_weights, "batch seq_len 1 -> (batch seq_len)")
+    router_weights = einops.rearrange(
+        router_weights, "batch seq_len 1 -> (batch seq_len)"
+    )
     router_decisions = einops.rearrange(
         router_decisions, "batch seq_len 1 -> (batch seq_len)"
     )
@@ -174,9 +176,7 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
         fused=True,
     )
 
-    model, optimizer, dataloader = accelerator.prepare(
-        model, optimizer, dataloader
-    )
+    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
 
     # Training loop
     for step, data in enumerate(dataloader):

@@ -21,7 +21,7 @@ class PicoHyperparameters:
     att_dropout: float = 0.2
 
     # - Full bytes blocks (FB)
-    fb_num_blocks: int = 2 # * 2 (before and after latent blocks)
+    fb_num_blocks: int = 2  # * 2 (before and after latent blocks)
     fb_att_window_size: int = 16
 
     # - Latent blocks (MoD)
