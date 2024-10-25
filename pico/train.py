@@ -9,6 +9,7 @@ from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
 from .model import Pico, PicoHyperparameters
+from .third_party.soap import SOAP
 
 
 def format_dataset(
@@ -156,7 +157,7 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
     }
 
     scaler = torch.GradScaler(device)
-    optimizer = torch.optim.AdamW(
+    optimizer = SOAP(
         [
             {
                 "params": [
@@ -173,7 +174,6 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
             },
         ],
         lr=model.params.learning_rate,
-        fused=True,
     )
 
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)

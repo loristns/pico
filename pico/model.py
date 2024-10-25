@@ -31,7 +31,7 @@ class PicoHyperparameters:
 
     # Train hyperparameters
     context_len: int = 6 * 1024
-    batch_size: int = 24
+    batch_size: int = 32
     grad_accumulation_steps: int = 1
     learning_rate: float = 1e-3
     warmup_steps: int = 150

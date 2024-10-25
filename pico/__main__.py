@@ -23,7 +23,7 @@ def train_command(
     model_path: Optional[str] = None,
     # Training hyperparameters
     context_len: Optional[int] = 6 * 1024,
-    batch_size: Optional[int] = 24,
+    batch_size: Optional[int] = 32,
     grad_accumulation_steps: Optional[int] = 1,
     learning_rate: Optional[float] = 1e-3,
     warmup_steps: Optional[int] = 150,
