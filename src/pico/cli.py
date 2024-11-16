@@ -41,6 +41,14 @@ class TrainingLogFile(BaseModel):
     checkpoints: list[TrainingStep] = []
 
 
+def _update_if_set(obj: object, **kwargs):
+    """Update object attributes only if they are explicitly set in kwargs (not None)."""
+    for key, value in kwargs.items():
+        if value is not None and hasattr(obj, key):
+            setattr(obj, key, value)
+    return obj
+
+
 @app.command("init")
 def init_command(
     path: pathlib.Path,
@@ -63,15 +71,18 @@ def init_command(
         case _:
             raise ValueError(f"Invalid preset: {preset}")
 
-    meta.dim = dim or meta.dim
-    meta.next_tokens = next_tokens or meta.next_tokens
-    meta.att_q_heads = att_q_heads or meta.att_q_heads
-    meta.att_kv_heads = att_kv_heads or meta.att_kv_heads
-    meta.fb_num_blocks = fb_num_blocks or meta.fb_num_blocks
-    meta.fb_att_window_size = fb_att_window_size or meta.fb_att_window_size
-    meta.latent_capacity_factor = latent_capacity_factor or meta.latent_capacity_factor
-    meta.latent_num_blocks = latent_num_blocks or meta.latent_num_blocks
-    meta.latent_att_window_size = latent_att_window_size or meta.latent_att_window_size
+    _update_if_set(
+        meta,
+        dim=dim,
+        next_tokens=next_tokens,
+        att_q_heads=att_q_heads,
+        att_kv_heads=att_kv_heads,
+        fb_num_blocks=fb_num_blocks,
+        fb_att_window_size=fb_att_window_size,
+        latent_capacity_factor=latent_capacity_factor,
+        latent_num_blocks=latent_num_blocks,
+        latent_att_window_size=latent_att_window_size,
+    )
 
     path.mkdir(exist_ok=False)
     model = Pico(meta)
@@ -124,15 +135,15 @@ def train_command(
 
     # Init training metadata
     training_meta = DEFAULT_TRAINING_META.model_copy()
-
-    training_meta.context_len = context_len or training_meta.context_len
-    training_meta.batch_size = batch_size or training_meta.batch_size
-    training_meta.learning_rate = learning_rate or training_meta.learning_rate
-    training_meta.weight_decay = weight_decay or training_meta.weight_decay
-    training_meta.max_steps = max_steps or training_meta.max_steps
-    training_meta.warmup_steps = warmup_steps or training_meta.warmup_steps
-    training_meta.grad_accumulation_steps = (
-        grad_accumulation_steps or training_meta.grad_accumulation_steps
+    _update_if_set(
+        training_meta,
+        context_len=context_len,
+        batch_size=batch_size,
+        learning_rate=learning_rate,
+        weight_decay=weight_decay,
+        max_steps=max_steps,
+        warmup_steps=warmup_steps,
+        grad_accumulation_steps=grad_accumulation_steps,
     )
 
     logger.info(training_meta.model_dump_json(indent=2))
