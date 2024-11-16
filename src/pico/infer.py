@@ -23,7 +23,7 @@ def infer(
     model.to(device)
 
     if prompt is None:
-        prompt = model.params.start_seq.encode("utf-8")
+        prompt = "<pico:seq>".encode("utf-8")
 
     init_seq = torch.tensor([*prompt], dtype=torch.long).unsqueeze(0).to(device)
     seq = init_seq

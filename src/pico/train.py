@@ -1,33 +1,66 @@
 import math
-from typing import Dict, Union
+from typing import Dict, Optional, Union
 
 import einops
 import torch
 from accelerate import Accelerator
 from datasets import Dataset, IterableDataset
+from pydantic import BaseModel, computed_field
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
-from .model import Pico, PicoHyperparameters
+from .model import Pico, PicoMeta
 from .third_party.soap import SOAP
+
+################################
+#   Training hyperparameters   #
+################################
+
+
+class TrainingMeta(BaseModel):
+    context_len: int
+    batch_size: int
+    learning_rate: float
+    weight_decay: float
+    max_steps: int
+    warmup_steps: int
+    grad_accumulation_steps: int
+
+
+DEFAULT_TRAINING_META = TrainingMeta(
+    context_len=6 * 1024,
+    batch_size=32,
+    learning_rate=1e-3,
+    weight_decay=0.1,
+    max_steps=3600,
+    warmup_steps=150,
+    grad_accumulation_steps=1,
+)
+
+
+#############
+#   Utils   #
+#############
 
 
 def format_dataset(
-    dataset: Union[Dataset, IterableDataset], params: PicoHyperparameters
+    dataset: Union[Dataset, IterableDataset],
+    pico_meta: PicoMeta,
+    training_meta: TrainingMeta,
 ):
     def _preprocess(batch: Dict[str, list[bytes]]):
+        START_SEQ = list("<pico:seq>".encode("utf-8"))
+        END_SEQ = list("</pico:seq>".encode("utf-8"))
+
         chunks = []
         current_buffer = []
 
-        window_len = params.context_len + params.next_tokens
+        window_len = training_meta.context_len + pico_meta.next_tokens
 
-        start_seq = list(params.start_seq.encode("utf-8"))
-        end_seq = list(params.end_seq.encode("utf-8"))
-
-        doc_separation_seq_len = len(start_seq) + len(end_seq)
+        doc_separation_seq_len = len(START_SEQ) + len(END_SEQ)
 
         for bytes in batch["bytes"]:
-            current_buffer.extend(start_seq)
+            current_buffer.extend(START_SEQ)
             current_buffer.extend(bytes)
 
             # Split the buffer into chunks of window_len
@@ -41,9 +74,9 @@ def format_dataset(
                 # Drop prefix
                 current_buffer = current_buffer[doc_separation_seq_len - 1 :]
 
-            current_buffer.extend(end_seq)
+            current_buffer.extend(END_SEQ)
 
-        chunks = torch.tensor(chunks).unfold(1, params.context_len, 1)
+        chunks = torch.tensor(chunks).unfold(1, training_meta.context_len, 1)
         chunks = einops.rearrange(
             chunks, "batch next_tokens seq_len -> batch seq_len next_tokens"
         )
@@ -62,18 +95,18 @@ def format_dataset(
     )
 
 
-def lr_schedule(step: int, params: PicoHyperparameters):
-    if step < params.warmup_steps:
-        return params.learning_rate * (step + 1) / params.warmup_steps
+def lr_schedule(step: int, training_meta: TrainingMeta):
+    if step < training_meta.warmup_steps:
+        return training_meta.learning_rate * (step + 1) / training_meta.warmup_steps
 
-    if step >= params.max_steps:
-        return 0.1 * params.learning_rate
+    if step >= training_meta.max_steps:
+        return 0.1 * training_meta.learning_rate
 
-    decay_ratio = (step - params.warmup_steps) / (
-        params.max_steps - params.warmup_steps
+    decay_ratio = (step - training_meta.warmup_steps) / (
+        training_meta.max_steps - training_meta.warmup_steps
     )
     coeff = 0.5 * (1.0 + math.cos(math.pi * decay_ratio))
-    return 0.1 * params.learning_rate + coeff * 0.9 * params.learning_rate
+    return 0.1 * training_meta.learning_rate + coeff * 0.9 * training_meta.learning_rate
 
 
 @torch.compile
@@ -138,17 +171,43 @@ def loss_fn(
 ################
 
 
-def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
+class TrainingStep(BaseModel):
+    i: int
+
+    loss: float
+    next_token_lm_loss: float
+    aux_loss: float
+
+    @computed_field
+    def bit_per_bytes(self) -> float:
+        return math.log2(math.exp(self.next_token_lm_loss))
+
+    @computed_field
+    def perplexity(self) -> float:
+        return math.exp(self.next_token_lm_loss)
+
+
+def train(
+    model: Pico,
+    dataset: Union[Dataset, IterableDataset],
+    training_meta: TrainingMeta = DEFAULT_TRAINING_META,
+    tracker_project_name: Optional[str] = None,
+):
     # Configure training
-    accelerator = Accelerator()
+    accelerator = Accelerator(log_with="all")
     device = accelerator.device
+
+    if tracker_project_name is not None:
+        accelerator.init_trackers(
+            tracker_project_name, config=training_meta.model_dump()
+        )
 
     model.train()
     model.to(device)
 
     dataloader = DataLoader(
-        format_dataset(dataset, model.params),
-        batch_size=model.params.batch_size,
+        format_dataset(dataset, model.metadata, training_meta),
+        batch_size=training_meta.batch_size,
         pin_memory=True,
     )
 
@@ -163,7 +222,7 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
                 "params": [
                     param for param in trainable_params.values() if param.dim() >= 2
                 ],
-                "weight_decay": model.params.weight_decay,
+                "weight_decay": training_meta.weight_decay,
             },
             # No weight decay for less than 2D parameters tensors (bias, RMSNorm, etc.)
             {
@@ -173,7 +232,7 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
                 "weight_decay": 0.0,
             },
         ],
-        lr=model.params.learning_rate,
+        lr=training_meta.learning_rate,
     )
 
     model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
@@ -190,28 +249,33 @@ def train(model: Pico, dataset: Union[Dataset, IterableDataset]):
             pred, router_weights, router_decisions, y
         )
 
-        yield {
-            "step": step,
-            "loss": loss.item(),
-            "next_token_lm_loss": next_token_lm_loss.item(),
-            "aux_loss": aux_loss.item(),
-        }
+        training_step = TrainingStep(
+            i=step,
+            loss=loss.item(),
+            next_token_lm_loss=next_token_lm_loss.item(),
+            aux_loss=aux_loss.item(),
+        )
 
-        loss = loss / model.params.grad_accumulation_steps
+        accelerator.log(training_step.model_dump(exclude=["i"]), step=step)
+        yield training_step
+
+        loss = loss / training_meta.grad_accumulation_steps
 
         accelerator.backward(
             scaler.scale(loss),
         )
 
-        if (step + 1) % model.params.grad_accumulation_steps == 0:
+        if (step + 1) % training_meta.grad_accumulation_steps == 0:
             scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
 
             # Update learning rate according to schedule before next optimizer step
-            lr = lr_schedule(step, model.params)
+            lr = lr_schedule(step, training_meta)
             for param_group in optimizer.param_groups:
                 param_group["lr"] = lr
 
             scaler.step(optimizer)
             scaler.update()
             optimizer.zero_grad()
+
+    accelerator.end_training()

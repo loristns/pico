@@ -1,8 +1,7 @@
-from dataclasses import dataclass
-
 import einops
 import torch
 from flash_attn import flash_attn_func
+from pydantic import BaseModel
 from torch import nn
 from torch.nn import functional as F
 
@@ -11,36 +10,31 @@ from torch.nn import functional as F
 ############################
 
 
-@dataclass
-class PicoHyperparameters:
-    # Model hyperparameters
-    dim: int = 128
-    next_tokens: int = 8
-    att_q_heads: int = 9
-    att_kv_heads: int = 3
-    att_dropout: float = 0.2
+class PicoMeta(BaseModel):
+    dim: int
+    next_tokens: int
+    att_q_heads: int
+    att_kv_heads: int
 
-    # - Full bytes blocks (FB)
-    fb_num_blocks: int = 2  # * 2 (before and after latent blocks)
-    fb_att_window_size: int = 16
+    fb_num_blocks: int
+    fb_att_window_size: int
 
-    # - Latent blocks (MoD)
-    latent_num_blocks: int = 12
-    latent_att_window_size: int = 512
-    latent_capacity_factor: float = 0.25
+    latent_capacity_factor: float
+    latent_num_blocks: int
+    latent_att_window_size: int
 
-    # Train hyperparameters
-    context_len: int = 6 * 1024
-    batch_size: int = 32
-    grad_accumulation_steps: int = 1
-    learning_rate: float = 1e-3
-    warmup_steps: int = 150
-    max_steps: int = 3600
-    weight_decay: float = 0.1
 
-    # Special sequences
-    start_seq: str = "<pico:seq>"
-    end_seq: str = "</pico:seq>"
+PICO_XS_PRESET = PicoMeta(
+    dim=128,
+    next_tokens=8,
+    att_q_heads=9,
+    att_kv_heads=3,
+    fb_num_blocks=2,
+    fb_att_window_size=16,
+    latent_capacity_factor=0.25,
+    latent_num_blocks=12,
+    latent_att_window_size=512,
+)
 
 
 #######################
@@ -55,7 +49,6 @@ class GQA(nn.Module):
         q_heads: int,
         kv_heads: int,
         window_size: int,
-        dropout: float,
     ):
         super().__init__()
 
@@ -64,7 +57,6 @@ class GQA(nn.Module):
         self.dim = dim
         self.window_size = window_size
         self.head_dim = dim // q_heads
-        self.dropout = dropout
 
         self.fused_qkv = nn.Linear(
             dim, (q_heads + 2 * kv_heads) * self.head_dim, bias=False
@@ -96,7 +88,6 @@ class GQA(nn.Module):
             causal=True,
             window_size=(self.window_size, self.window_size),
             alibi_slopes=self.alibi_slopes,
-            dropout_p=self.dropout if self.training else 0.0,
         )
 
         att = einops.rearrange(
@@ -130,14 +121,13 @@ class Block(nn.Module):
         att_q_heads: int,
         att_kv_heads: int,
         att_window_size: int,
-        att_dropout: float,
     ):
         super().__init__()
 
         self.norm1 = nn.RMSNorm(dim)
         self.norm2 = nn.RMSNorm(dim)
 
-        self.att = GQA(dim, att_q_heads, att_kv_heads, att_window_size, att_dropout)
+        self.att = GQA(dim, att_q_heads, att_kv_heads, att_window_size)
         self.glu = SwiGLU(dim)
 
     def forward(self, x: torch.Tensor):
@@ -155,11 +145,10 @@ class BlockSeq(nn.Module):
         att_q_heads: int,
         att_kv_heads: int,
         att_window_size: int,
-        att_dropout: float,
     ):
         super().__init__()
         self.blocks = nn.ModuleList(
-            Block(dim, att_q_heads, att_kv_heads, att_window_size, att_dropout)
+            Block(dim, att_q_heads, att_kv_heads, att_window_size)
             for _ in range(num_blocks)
         )
 
@@ -179,7 +168,6 @@ class LatentBlockSeq(BlockSeq):
         att_q_heads: int,
         att_kv_heads: int,
         att_window_size: int,
-        att_dropout: float,
     ):
         super().__init__(
             num_blocks,
@@ -187,7 +175,6 @@ class LatentBlockSeq(BlockSeq):
             att_q_heads,
             att_kv_heads,
             att_window_size,
-            att_dropout,
         )
 
         self.dim = dim
@@ -272,33 +259,32 @@ class LatentBlockSeq(BlockSeq):
 
 
 class Pico(nn.Module):
-    def __init__(self, params: PicoHyperparameters):
+    def __init__(self, metadata: PicoMeta):
         super().__init__()
-        self.params = params
+        self.metadata = metadata
 
-        self.embedding = nn.Embedding(256, params.dim)
-        self.unembedding = nn.Linear(params.dim, 256 * params.next_tokens)
+        self.embedding = nn.Embedding(256, metadata.dim)
+        self.unembedding = nn.Linear(metadata.dim, 256 * metadata.next_tokens)
 
         fb_params = {
-            "num_blocks": params.fb_num_blocks,
-            "dim": params.dim,
-            "att_q_heads": params.att_q_heads,
-            "att_kv_heads": params.att_kv_heads,
-            "att_dropout": params.att_dropout,
-            "att_window_size": params.fb_att_window_size,
+            "num_blocks": metadata.fb_num_blocks,
+            "dim": metadata.dim,
+            "att_q_heads": metadata.att_q_heads,
+            "att_kv_heads": metadata.att_kv_heads,
+            "att_window_size": metadata.fb_att_window_size,
         }
         latent_params = {
             **fb_params,
-            "num_blocks": params.latent_num_blocks,
-            "capacity_factor": params.latent_capacity_factor,
-            "att_window_size": params.latent_att_window_size,
+            "num_blocks": metadata.latent_num_blocks,
+            "capacity_factor": metadata.latent_capacity_factor,
+            "att_window_size": metadata.latent_att_window_size,
         }
 
         self.fb_in = BlockSeq(**fb_params)
         self.latent = LatentBlockSeq(**latent_params)
         self.fb_out = BlockSeq(**fb_params)
 
-        self.norm = nn.RMSNorm(params.dim)
+        self.norm = nn.RMSNorm(metadata.dim)
 
     def forward(self, x: torch.Tensor):
         x = self.embedding(x)
@@ -316,7 +302,7 @@ class Pico(nn.Module):
         x = einops.rearrange(
             x,
             "batch seq_len (next_tokens probs) -> batch seq_len next_tokens probs",
-            next_tokens=self.params.next_tokens,
+            next_tokens=self.metadata.next_tokens,
         )
 
         return x, router_weights, router_decisions
