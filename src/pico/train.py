@@ -25,6 +25,7 @@ class TrainingMeta(BaseModel):
     max_steps: int
     warmup_steps: int
     grad_accumulation_steps: int
+    validation_interval: int
 
 
 DEFAULT_TRAINING_META = TrainingMeta(
@@ -35,7 +36,30 @@ DEFAULT_TRAINING_META = TrainingMeta(
     max_steps=3600,
     warmup_steps=150,
     grad_accumulation_steps=1,
+    validation_interval=100,
 )
+
+
+class TrainingStepMetrics(BaseModel):
+    loss: float
+    next_token_lm_loss: float
+    aux_loss: float
+
+    @computed_field
+    @property
+    def bits_per_byte(self) -> float:
+        return math.log2(math.exp(self.next_token_lm_loss))
+
+    @computed_field
+    @property
+    def perplexity(self) -> float:
+        return math.exp(self.next_token_lm_loss)
+
+
+class TrainingStep(BaseModel):
+    i: int
+    train: TrainingStepMetrics
+    validation: Optional[TrainingStepMetrics] = None
 
 
 #############
@@ -166,35 +190,57 @@ def loss_fn(
     return lm_loss, aux_loss, next_token_lm_loss
 
 
+@torch.no_grad()
+def get_validation_metrics(
+    model: Pico,
+    dataloader: DataLoader,
+    device: torch.device,
+) -> TrainingStepMetrics:
+    total_loss = 0.0
+    total_aux_loss = 0.0
+    total_next_token_loss = 0.0
+    num_steps = 0
+
+    for data in dataloader:
+        x = data["x"].to(device)
+        y = data["y"].to(device)
+
+        pred, router_weights, router_decisions = model(x)
+
+        loss, aux_loss, next_token_lm_loss = loss_fn(
+            pred, router_weights, router_decisions, y
+        )
+
+        total_loss += loss.item()
+        total_aux_loss += aux_loss.item()
+        total_next_token_loss += next_token_lm_loss.item()
+        num_steps += 1
+
+    return TrainingStepMetrics(
+        loss=total_loss / num_steps,
+        aux_loss=total_aux_loss / num_steps,
+        next_token_lm_loss=total_next_token_loss / num_steps,
+    )
+
+
 ################
 #   Training   #
 ################
 
 
-class TrainingStep(BaseModel):
-    i: int
-
-    loss: float
-    next_token_lm_loss: float
-    aux_loss: float
-
-    @computed_field
-    def bit_per_bytes(self) -> float:
-        return math.log2(math.exp(self.next_token_lm_loss))
-
-    @computed_field
-    def perplexity(self) -> float:
-        return math.exp(self.next_token_lm_loss)
-
-
 def train(
     model: Pico,
     dataset: Union[Dataset, IterableDataset],
+    validation_dataset: Optional[Union[Dataset, IterableDataset]] = None,
     training_meta: TrainingMeta = DEFAULT_TRAINING_META,
     tracker_project_name: Optional[str] = None,
 ):
     # Configure training
-    accelerator = Accelerator(log_with="all")
+    accelerator = Accelerator(
+        mixed_precision="bf16",
+        gradient_accumulation_steps=training_meta.grad_accumulation_steps,
+        log_with="all",
+    )
     device = accelerator.device
 
     if tracker_project_name is not None:
@@ -211,11 +257,18 @@ def train(
         pin_memory=True,
     )
 
+    validation_dataloader = None
+    if validation_dataset is not None:
+        validation_dataloader = DataLoader(
+            format_dataset(validation_dataset, model.metadata, training_meta),
+            batch_size=training_meta.batch_size,
+            pin_memory=True,
+        )
+
     trainable_params = {
         name: param for name, param in model.named_parameters() if param.requires_grad
     }
 
-    scaler = torch.GradScaler(device)
     optimizer = SOAP(
         [
             {
@@ -239,43 +292,47 @@ def train(
 
     # Training loop
     for step, data in enumerate(dataloader):
-        x = data["x"]
-        y = data["y"]
-
-        with torch.autocast(device.type, dtype=torch.bfloat16):
+        with accelerator.accumulate(model):
+            x = data["x"]
+            y = data["y"]
             pred, router_weights, router_decisions = model(x)
 
         loss, aux_loss, next_token_lm_loss = loss_fn(
             pred, router_weights, router_decisions, y
         )
 
+        validation_metrics = None
+        if (
+            validation_dataloader is not None
+            and step % training_meta.validation_interval == 0
+            and step > 0
+        ):
+            validation_metrics = get_validation_metrics(
+                model, validation_dataloader, device
+            )
+
         training_step = TrainingStep(
             i=step,
-            loss=loss.item(),
-            next_token_lm_loss=next_token_lm_loss.item(),
-            aux_loss=aux_loss.item(),
+            train=TrainingStepMetrics(
+                loss=loss.item(),
+                next_token_lm_loss=next_token_lm_loss.item(),
+                aux_loss=aux_loss.item(),
+            ),
+            validation=validation_metrics,
         )
 
         accelerator.log(training_step.model_dump(exclude=["i"]), step=step)
         yield training_step
 
         loss = loss / training_meta.grad_accumulation_steps
+        accelerator.backward(loss)
 
-        accelerator.backward(
-            scaler.scale(loss),
-        )
+        # Update learning rate according to schedule before next optimizer step
+        lr = lr_schedule(step, training_meta)
+        for param_group in optimizer.param_groups:
+            param_group["lr"] = lr
 
-        if (step + 1) % training_meta.grad_accumulation_steps == 0:
-            scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-
-            # Update learning rate according to schedule before next optimizer step
-            lr = lr_schedule(step, training_meta)
-            for param_group in optimizer.param_groups:
-                param_group["lr"] = lr
-
-            scaler.step(optimizer)
-            scaler.update()
-            optimizer.zero_grad()
+        optimizer.step()
+        optimizer.zero_grad()
 
     accelerator.end_training()

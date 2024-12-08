@@ -21,16 +21,13 @@ dependencies = [
     "wandb>=0.18.6",
 ]
 
-[project.scripts]
-picolm = "pico.cli:app"
-
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.uv.sources]
 torch = [
-  { index = "pytorch-cu121" },
+    { index = "pytorch-cu121" },
 ]
 flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/download/v2.6.3/flash_attn-2.6.3+cu123torch2.4cxx11abiFALSE-cp311-cp311-linux_x86_64.whl" }
 
@@ -38,3 +35,8 @@ flash-attn = { url = "https://github.com/Dao-AILab/flash-attention/releases/down
 name = "pytorch-cu121"
 url = "https://download.pytorch.org/whl/cu121"
 explicit = true
+
+[dependency-groups]
+dev = [
+    "ruff>=0.8.2",
+]
