@@ -397,6 +397,7 @@ def run_command(
             char = decoder.decode(iteration.byte)
         except UnicodeDecodeError:
             char = "�"
+            decoder.reset()
 
         print(char, end="", flush=True)
 
