@@ -348,12 +348,8 @@ def run_command(
         int,
         typer.Option(help="Checkpoint to load (default: -1 for latest)"),
     ] = -1,
-    prompt: Annotated[
-        str, typer.Option(help="Prompt to start generation from")
-    ] = "",
-    temperature: Annotated[
-        float, typer.Option(help="Generation temperature")
-    ] = 1.0,
+    prompt: Annotated[str, typer.Option(help="Prompt to start generation from")] = "",
+    temperature: Annotated[float, typer.Option(help="Generation temperature")] = 1.0,
     show_router_decisions: Annotated[
         bool, typer.Option(help="Show router decisions")
     ] = False,
@@ -394,11 +390,11 @@ def run_command(
         temperature=temperature,
         stop_end_seq=False,
     ):
-        if show_router_decisions and iteration["router_decision"]:
+        if show_router_decisions and iteration.router_decision:
             print("_", end="", flush=True)
 
         try:
-            char = decoder.decode(bytes([iteration["byte"]]))
+            char = decoder.decode(iteration.byte)
         except UnicodeDecodeError:
             char = "�"
 

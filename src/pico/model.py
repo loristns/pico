@@ -15,10 +15,8 @@ class PicoMeta(BaseModel):
     next_tokens: int
     att_q_heads: int
     att_kv_heads: int
-
     fb_num_blocks: int
     fb_att_window_size: int
-
     latent_capacity_factor: float
     latent_num_blocks: int
     latent_att_window_size: int
@@ -40,6 +38,8 @@ PICO_XS_PRESET = PicoMeta(
 #######################
 #   Building blocks   #
 #######################
+
+KVCache = tuple[torch.Tensor, torch.Tensor]
 
 
 class GQA(nn.Module):
@@ -67,7 +67,7 @@ class GQA(nn.Module):
         self.alibi_slopes = torch.exp2(-((self.alibi_slopes + 1) * 8.0 / q_heads))
         self.alibi_slopes = self.alibi_slopes.cuda()
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, kv_cache: KVCache | None = None):
         qkv = self.fused_qkv(x)
         qkv = einops.rearrange(
             qkv,
@@ -80,6 +80,11 @@ class GQA(nn.Module):
         # k: [batch, seq_len, kv_heads, head_dim]
         # v: [batch, seq_len, kv_heads, head_dim]
         q, k, v = torch.split(qkv, [self.q_heads, self.kv_heads, self.kv_heads], dim=2)
+
+        if kv_cache is not None:
+            k_cache, v_cache = kv_cache
+            k = torch.cat([k_cache, k], dim=1)
+            v = torch.cat([v_cache, v], dim=1)
 
         att = flash_attn_func(
             q,
@@ -95,7 +100,15 @@ class GQA(nn.Module):
         )
         out = self.proj(att)
 
-        return out
+        # Store next kv cache only on inference
+        next_kv_cache = None
+        if not self.training:
+            if self.window_size == -1:
+                next_kv_cache = (k, v)
+            else:
+                next_kv_cache = (k[:, -self.window_size :], v[:, -self.window_size :])
+
+        return out, next_kv_cache
 
 
 class SwiGLU(nn.Module):
@@ -130,11 +143,12 @@ class Block(nn.Module):
         self.att = GQA(dim, att_q_heads, att_kv_heads, att_window_size)
         self.glu = SwiGLU(dim)
 
-    def forward(self, x: torch.Tensor):
-        x = x + self.att(self.norm1(x))
+    def forward(self, x: torch.Tensor, kv_cache: KVCache | None = None):
+        res = self.norm1(x)
+        res, next_kv_cache = self.att(res, kv_cache)
+        x = x + res
         x = x + self.glu(self.norm2(x))
-
-        return x
+        return x, next_kv_cache
 
 
 class BlockSeq(nn.Module):
@@ -152,11 +166,16 @@ class BlockSeq(nn.Module):
             for _ in range(num_blocks)
         )
 
-    def forward(self, x: torch.Tensor):
-        for block in self.blocks:
-            x = block(x)
+    def forward(self, x: torch.Tensor, kv_caches: list[KVCache | None] | None = None):
+        if kv_caches is None:
+            kv_caches = [None] * len(self.blocks)
 
-        return x
+        next_kv_caches = []
+        for block, kv_cache in zip(self.blocks, kv_caches):
+            x, next_kv_cache = block(x, kv_cache)
+            next_kv_caches.append(next_kv_cache)
+
+        return x, next_kv_caches
 
 
 class LatentBlockSeq(BlockSeq):
@@ -182,7 +201,7 @@ class LatentBlockSeq(BlockSeq):
 
         self.router = nn.Linear(dim, 1, bias=False)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, kv_caches: list[KVCache | None] | None = None):
         batch_size = x.shape[0]
         seq_len = x.shape[1]
 
@@ -203,9 +222,10 @@ class LatentBlockSeq(BlockSeq):
         # Skip computations if capacity is 0
         if capacity == 0:
             return (
-                torch.zeros_like(x),
+                torch.zeros_like(x),  # pred
                 router_weights,
-                torch.zeros_like(router_weights),
+                torch.zeros_like(router_weights),  # router_decisions
+                [None] * len(self.blocks),  # next_kv_caches
             )
 
         # [batch, capacity, 1]
@@ -227,7 +247,7 @@ class LatentBlockSeq(BlockSeq):
         latent_x = torch.gather(x, dim=1, index=router_top_indices_exp)
 
         # Apply blocks
-        latent_x = super().forward(latent_x)
+        latent_x, next_kv_caches = super().forward(latent_x, kv_caches)
 
         # Apply router weights
         latent_x = latent_x * router_top_weights
@@ -250,7 +270,7 @@ class LatentBlockSeq(BlockSeq):
             src=torch.ones_like(router_weights),
         )
 
-        return pred, router_weights, router_decisions
+        return pred, router_weights, router_decisions, next_kv_caches
 
 
 ########################
@@ -286,15 +306,31 @@ class Pico(nn.Module):
 
         self.norm = nn.RMSNorm(metadata.dim)
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, kv_caches: list[KVCache | None] | None = None):
+        # Init kv caches
+        if kv_caches is None:
+            kv_caches = [None] * (
+                self.metadata.fb_num_blocks * 2 + self.metadata.latent_num_blocks
+            )
+
+        # Split kv caches per block
+        fb_in_kv_caches = kv_caches[: self.metadata.fb_num_blocks]
+        latent_kv_caches = kv_caches[
+            self.metadata.fb_num_blocks : -self.metadata.fb_num_blocks
+        ]
+        fb_out_kv_caches = kv_caches[-self.metadata.fb_num_blocks :]
+
+        # Execute model
         x = self.embedding(x)
 
-        x = self.fb_in(x)
+        x, next_fb_in_kv_caches = self.fb_in(x, fb_in_kv_caches)
 
-        latent_pred, router_weights, router_decisions = self.latent(x)
+        latent_pred, router_weights, router_decisions, next_latent_kv_caches = (
+            self.latent(x, latent_kv_caches)
+        )
         x = x + latent_pred
 
-        x = self.fb_out(x)
+        x, next_fb_out_kv_caches = self.fb_out(x, fb_out_kv_caches)
 
         x = self.norm(x)
         x = self.unembedding(x)
@@ -305,4 +341,11 @@ class Pico(nn.Module):
             next_tokens=self.metadata.next_tokens,
         )
 
-        return x, router_weights, router_decisions
+        # Concatenate all kv caches
+        next_kv_caches = [
+            *next_fb_in_kv_caches,
+            *next_latent_kv_caches,
+            *next_fb_out_kv_caches,
+        ]
+
+        return x, router_weights, router_decisions, next_kv_caches

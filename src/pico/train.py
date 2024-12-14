@@ -40,6 +40,11 @@ DEFAULT_TRAINING_META = TrainingMeta(
 )
 
 
+#############
+#   Utils   #
+#############
+
+
 class TrainingStepMetrics(BaseModel):
     loss: float
     next_token_lm_loss: float
@@ -60,11 +65,6 @@ class TrainingStep(BaseModel):
     i: int
     train: TrainingStepMetrics
     validation: Optional[TrainingStepMetrics] = None
-
-
-#############
-#   Utils   #
-#############
 
 
 def format_dataset(
@@ -205,7 +205,7 @@ def get_validation_metrics(
         x = data["x"].to(device)
         y = data["y"].to(device)
 
-        pred, router_weights, router_decisions = model(x)
+        pred, router_weights, router_decisions, _ = model(x)
 
         loss, aux_loss, next_token_lm_loss = loss_fn(
             pred, router_weights, router_decisions, y
@@ -295,7 +295,7 @@ def train(
         with accelerator.accumulate(model):
             x = data["x"]
             y = data["y"]
-            pred, router_weights, router_decisions = model(x)
+            pred, router_weights, router_decisions, _ = model(x)
 
         loss, aux_loss, next_token_lm_loss = loss_fn(
             pred, router_weights, router_decisions, y
