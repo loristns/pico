@@ -128,7 +128,7 @@ def _prepare_dataset(
     )
 
     if shuffle:
-        dataset = dataset.shuffle(seed=42)
+        dataset = dataset.shuffle(seed=42, buffer_size=100_000)
 
     return dataset
 
@@ -313,7 +313,7 @@ def train_command(
         ) / 1000
 
         logger.info(
-            f"[{step.i}]\t lm: {step.train.next_token_lm_loss:.4f} ({step.train.bits_per_byte:.2f} bPB, pplx: {step.train.perplexity:.2f}), aux: {step.train.aux_loss:.4f}\t ({kb_per_sec:.0f} kB/s)"
+            f"[{step.i}]\t lm: {step.train.next_token_lm_loss:.4f} ({step.train.bits_per_byte:.2f} bpB, pplx: {step.train.perplexity:.2f}), aux: {step.train.aux_loss:.4f}\t ({kb_per_sec:.0f} kB/s)"
         )
 
         if step.i % 500 == 0:
