@@ -34,40 +34,75 @@ def infer(
     if prompt is None:
         prompt = "<pico:seq>".encode("utf-8")
 
-    init_seq = torch.tensor([*prompt], dtype=torch.long).unsqueeze(0).to(device)
-    x = init_seq
-
-    seq = prompt
-
     iteration = 0
-
+    byte_sequence = prompt
+    x = torch.tensor([*prompt], dtype=torch.long).unsqueeze(0).to(device)
     kv_caches = None
 
     while True:
         with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16):
-            pred, router_weights, router_decisions, kv_caches = model(
-                x, kv_caches=kv_caches
+            logits, _, _, kv_caches = model(x, kv_caches=kv_caches)
+
+        predicted_suffix = []
+
+        for next_token in range(model.metadata.next_tokens):
+            head_pred = F.softmax(logits[:, -1, next_token, :] * temperature, dim=-1)
+
+            # First token head: predict immediate next token -> standard sampling
+            if next_token == 0:
+                head_pred = torch.multinomial(head_pred, 1)
+
+            # Next token heads: predict next n tokens -> greedy sampling + validation
+            else:
+                head_pred = torch.argmax(head_pred)
+
+            predicted_suffix.append(head_pred.item())
+
+        # Validate next n tokens
+        validated_suffix = [predicted_suffix[0]]  # Immediate next token is always validated
+    
+        with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16):
+            spec_x = (
+                torch.tensor(predicted_suffix, dtype=torch.long)
+                .unsqueeze(0)
+                .to(device)
+            )
+            verif_logits, router_weights, router_decisions, _ = model(
+                spec_x, kv_caches=kv_caches
             )
 
-        pred = F.softmax(pred[:, -1, 0, :] * temperature, dim=-1)
-        pred = torch.multinomial(pred, 1)
+        for next_token in range(model.metadata.next_tokens - 1):
+            head_pred = F.softmax(
+                verif_logits[:, next_token, 0, :] * temperature, dim=-1
+            )
+            head_pred = torch.multinomial(head_pred, 1)
 
-        x = pred
-        byte = bytes([pred.item()])
-        iteration += 1
-        seq += byte
-        router_decision = router_decisions[:, -1].item()
+            if head_pred.item() != predicted_suffix[next_token + 1]:
+                break
+    
+            validated_suffix.append(head_pred.item())
 
-        yield InferenceStep(
-            iteration=iteration,
-            byte=byte,
-            seq=seq,
-            router_decision=router_decision == 1,
-            router_weight=router_weights[:, -1, :].item(),
-        )
+        # Send every validated token
+        for i, token in enumerate(validated_suffix):
+            iteration += 1
+            byte = bytes([token])
+            byte_sequence += byte
+
+            yield InferenceStep(
+                iteration=iteration,
+                byte=byte,
+                seq=byte_sequence,
+                router_decision=router_decisions[:, i].item() == 1,
+                router_weight=router_weights[:, i, :].item(),
+            )
 
         if max_iteration > 0 and iteration >= max_iteration:
             break
 
-        if stop_end_seq and seq.endswith(model.params.end_seq.encode("utf-8")):
+        if stop_end_seq and byte_sequence.endswith(
+            model.params.end_seq.encode("utf-8")
+        ):
             break
+
+        # Next loop
+        x = torch.tensor(validated_suffix, dtype=torch.long).unsqueeze(0).to(device)
