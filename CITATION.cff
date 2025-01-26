@@ -1,0 +1,9 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it as below."
+authors:
+- family-names: "Nezan"
+  given-names: "Loris"
+title: "Pico byte-level language model architecture"
+license: Apache-2.0
+date-released: "2025-01-25"
+url: "https://github.com/loristns/pico"
