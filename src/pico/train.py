@@ -73,8 +73,8 @@ def format_dataset(
     training_meta: TrainingMeta,
 ):
     def _preprocess(batch: Dict[str, list[bytes]]):
-        START_SEQ = list("<pico:seq>".encode("utf-8"))
-        END_SEQ = list("</pico:seq>".encode("utf-8"))
+        START_SEQ = list(b"<pico:seq>")
+        END_SEQ = list(b"</pico:seq>")
 
         chunks = []
         current_buffer = []

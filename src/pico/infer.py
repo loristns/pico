@@ -32,7 +32,7 @@ def infer(
     model.to(device)
 
     if prompt is None:
-        prompt = "<pico:seq>".encode("utf-8")
+        prompt = b"<pico:seq>"
 
     iteration = 0
     byte_sequence = prompt
@@ -59,13 +59,13 @@ def infer(
             predicted_suffix.append(head_pred.item())
 
         # Validate next n tokens
-        validated_suffix = [predicted_suffix[0]]  # Immediate next token is always validated
-    
+        validated_suffix = [
+            predicted_suffix[0]
+        ]  # Immediate next token is always validated
+
         with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16):
             spec_x = (
-                torch.tensor(predicted_suffix, dtype=torch.long)
-                .unsqueeze(0)
-                .to(device)
+                torch.tensor(predicted_suffix, dtype=torch.long).unsqueeze(0).to(device)
             )
             verif_logits, router_weights, router_decisions, _ = model(
                 spec_x, kv_caches=kv_caches
@@ -79,7 +79,7 @@ def infer(
 
             if head_pred.item() != predicted_suffix[next_token + 1]:
                 break
-    
+
             validated_suffix.append(head_pred.item())
 
         # Send every validated token
@@ -96,13 +96,11 @@ def infer(
                 router_weight=router_weights[:, i, :].item(),
             )
 
-        if max_iteration > 0 and iteration >= max_iteration:
-            break
+            if max_iteration > 0 and iteration >= max_iteration:
+                return
 
-        if stop_end_seq and byte_sequence.endswith(
-            model.params.end_seq.encode("utf-8")
-        ):
-            break
+            if stop_end_seq and byte_sequence.endswith(b"</pico:seq>"):
+                return
 
         # Next loop
         x = torch.tensor(validated_suffix, dtype=torch.long).unsqueeze(0).to(device)
