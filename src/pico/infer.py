@@ -36,7 +36,7 @@ def infer(
 
     iteration = 0
     byte_sequence = prompt
-    x = torch.tensor([*prompt], dtype=torch.long).unsqueeze(0).to(device)
+    x = torch.tensor([*prompt], device=device, dtype=torch.long).unsqueeze(0)
     kv_caches = None
 
     while True:
@@ -64,9 +64,9 @@ def infer(
         ]  # Immediate next token is always validated
 
         with torch.no_grad(), torch.autocast(device.type, dtype=torch.bfloat16):
-            spec_x = (
-                torch.tensor(predicted_suffix, dtype=torch.long).unsqueeze(0).to(device)
-            )
+            spec_x = torch.tensor(
+                predicted_suffix, device=device, dtype=torch.long
+            ).unsqueeze(0)
             verif_logits, router_weights, router_decisions, _ = model(
                 spec_x, kv_caches=kv_caches
             )
@@ -103,4 +103,4 @@ def infer(
                 return
 
         # Next loop
-        x = torch.tensor(validated_suffix, dtype=torch.long).unsqueeze(0).to(device)
+        x = torch.tensor(validated_suffix, device=device, dtype=torch.long).unsqueeze(0)

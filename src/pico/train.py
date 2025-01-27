@@ -123,7 +123,7 @@ def lr_schedule(step: int, training_meta: TrainingMeta):
     if step < training_meta.warmup_steps:
         return training_meta.learning_rate * (step + 1) / training_meta.warmup_steps
 
-    if step >= training_meta.max_steps:
+    if step >= training_meta.max_steps - 1:
         return 0.1 * training_meta.learning_rate
 
     decay_ratio = (step - training_meta.warmup_steps) / (
@@ -297,42 +297,41 @@ def train(
             y = data["y"]
             pred, router_weights, router_decisions, _ = model(x)
 
-        loss, aux_loss, next_token_lm_loss = loss_fn(
-            pred, router_weights, router_decisions, y
-        )
-
-        validation_metrics = None
-        if (
-            validation_dataloader is not None
-            and step % training_meta.validation_interval == 0
-            and step > 0
-        ):
-            validation_metrics = get_validation_metrics(
-                model, validation_dataloader, device
+            loss, aux_loss, next_token_lm_loss = loss_fn(
+                pred, router_weights, router_decisions, y
             )
 
-        training_step = TrainingStep(
-            i=step,
-            train=TrainingStepMetrics(
-                loss=loss.item(),
-                next_token_lm_loss=next_token_lm_loss.item(),
-                aux_loss=aux_loss.item(),
-            ),
-            validation=validation_metrics,
-        )
+            validation_metrics = None
+            if (
+                validation_dataloader is not None
+                and step % training_meta.validation_interval == 0
+                and step > 0
+            ):
+                validation_metrics = get_validation_metrics(
+                    model, validation_dataloader, device
+                )
 
-        accelerator.log(training_step.model_dump(exclude=["i"]), step=step)
-        yield training_step
+            training_step = TrainingStep(
+                i=step,
+                train=TrainingStepMetrics(
+                    loss=loss.item(),
+                    next_token_lm_loss=next_token_lm_loss.item(),
+                    aux_loss=aux_loss.item(),
+                ),
+                validation=validation_metrics,
+            )
 
-        loss = loss / training_meta.grad_accumulation_steps
-        accelerator.backward(loss)
+            accelerator.log(training_step.model_dump(exclude=["i"]), step=step)
+            yield training_step
 
-        # Update learning rate according to schedule before next optimizer step
-        lr = lr_schedule(step, training_meta)
-        for param_group in optimizer.param_groups:
-            param_group["lr"] = lr
+            accelerator.backward(loss)
 
-        optimizer.step()
-        optimizer.zero_grad()
+            # Update learning rate according to schedule before next optimizer step
+            lr = lr_schedule(step, training_meta)
+            for param_group in optimizer.param_groups:
+                param_group["lr"] = lr
+
+            optimizer.step()
+            optimizer.zero_grad()
 
     accelerator.end_training()
