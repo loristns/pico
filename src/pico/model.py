@@ -247,10 +247,13 @@ class LatentBlockSeq(BlockSeq):
         latent_x = torch.gather(x, dim=1, index=router_top_indices_exp)
 
         # Apply blocks
-        latent_x, next_kv_caches = super().forward(latent_x, kv_caches)
+        latent_block_pred, next_kv_caches = super().forward(latent_x, kv_caches)
+
+        # Fix residuals
+        latent_block_pred = latent_block_pred - latent_x
 
         # Apply router weights
-        latent_x = latent_x * router_top_weights
+        latent_block_pred = latent_block_pred * router_top_weights
 
         # Scatter back to original sequence (filling the rest with zeros)
         # [batch, seq_len, dim]
@@ -258,10 +261,10 @@ class LatentBlockSeq(BlockSeq):
             torch.zeros_like(x),
             dim=1,
             index=router_top_indices_exp,
-            src=latent_x,
+            src=latent_block_pred,
         )
 
-        # During training: ground truth for Mixtures-of-Depth auxiliary loss
+        # During training: ground truth for Mixture-of-Depths auxiliary loss
         # During inference: binary vector for router decisions
         router_decisions = torch.scatter(
             torch.zeros_like(router_weights),
