@@ -225,7 +225,7 @@ class LatentBlockSeq(BlockSeq):
                 torch.zeros_like(x),  # pred
                 router_weights,
                 torch.zeros_like(router_weights),  # router_decisions
-                [None] * len(self.blocks),  # next_kv_caches
+                kv_caches if kv_caches else [None] * len(self.blocks),  # next_kv_caches
             )
 
         # [batch, capacity, 1]
