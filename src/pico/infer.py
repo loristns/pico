@@ -46,7 +46,7 @@ def infer(
         predicted_suffix = []
 
         for next_token in range(model.metadata.next_tokens):
-            head_pred = F.softmax(logits[:, -1, next_token, :] * temperature, dim=-1)
+            head_pred = F.softmax(logits[:, -1, next_token, :] / temperature, dim=-1)
 
             # First token head: predict immediate next token -> standard sampling
             if next_token == 0:

@@ -5,7 +5,7 @@ a Mixture-of-Depths routing mechanism.
 
 ![Pico architecture](assets/architecture.svg)
 
-- Mixtures-of-Depths[^1] router as a dynamic multiscale modeling mechanism
+- Mixture-of-Depths[^1] router as a dynamic multiscale modeling mechanism
 - Multi-token prediction[^2] heads to unlock self-speculative decoding
 at inference time, allowing the model to generate multiple tokens in parallel.
 - Sliding window, grouped-query attention
