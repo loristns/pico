@@ -1,26 +1,54 @@
 # 🤏Pico
 
-Pico is a byte-level language model architecture that eliminates tokenization using
-a Mixture-of-Depths routing mechanism.
+Pico is my experimental decoder-only architecture designed to bypass tokenization by processing raw bytes directly.
 
 ![Pico architecture](assets/architecture.svg)
 
-- Mixture-of-Depths[^1] router as a dynamic multiscale modeling mechanism
-- Multi-token prediction[^2] heads to unlock self-speculative decoding
-at inference time, allowing the model to generate multiple tokens in parallel.
+To offset the computational cost of working at the byte level, the model employs sliding window attention over a small context.
+To reintroduce longer-range dependencies, intermediate transformer blocks operate on larger windows, but they are selectively applied over a small fixed fraction of the bytes using a [Mixture-of-Depths](https://arxiv.org/abs/2404.02258) router.
+
+This architecture share similarities with [SpaceByte](https://github.com/kjslag/spacebyte), but instead of applying intermediate transformer blocks when encountering whitespaces, Pico learns by itself when to insert them in an end-to-end manner.
+
+I also experimented with [multi-byte prediction](https://arxiv.org/abs/2404.19737), which allows the model to not only predict the next byte but also the next few bytes.
+This has been shown to improve the performance of byte-level models, although probably not at the scale I run my experiments but it also allows for *self-speculative decoding* at inference time.
+
+Other architectural choices include:
 - Sliding window, grouped-query attention
-- ALiBi positional encoding[^3]
-- SwiGLU[^4]
-- Training with SOAP optimizer[^5]
+- SwiGLU
+- [ALiBi positional encoding](https://arxiv.org/abs/2108.12409) (might try RoPE later)
+- [SOAP optimizer](https://arxiv.org/abs/2409.11321) for pretraining
 
-This architecture is inspired by [SpaceByte](https://github.com/kjslag/spacebyte)[^6],
-but allows the model to learn when to insert latent blocks by itself in an end-to-end manner.
+Here is an example of the output of a ~10M parameters Pico model trained on the [TinyStories](https://huggingface.co/datasets/roneneldan/TinyStories) dataset:
 
-*Work in progress*.
+```
+Once_ upon_ a t_ime,_ there_ _was a l_ittle_ g_irl_ named_ Lily._ She_ loved_ to_ play_ outs_ide_ _in_ the_ park._ One_ day,_ she_ sa_w_ a _bee_ fly_ing_ around_ her_ and sa_id,_ _"Hello,_ _bee!_ Do_ you_ _want_ to_ play_ _w_ith_ me?_"
 
-[^1]: David Raposo, Sam Ritter, Blake Richards, Timothy Lillicrap, Peter Conway Humphreys, and Adam Santoro. [Mixture-of-Depths: Dynamically allocating compute in transformer-based language models](https://arxiv.org/abs/2404.02258) arXiv preprint arXiv:2404.02258, 2024.
-[^2]: Fabian Gloeckle and Badr Youbi Idrissi and Baptiste Rozière and David Lopez-Paz and Gabriel Synnaeve. [Better & Faster Large Language Models via Multi-token Prediction](https://arxiv.org/abs/2404.19737) arXiv preprint arXiv:2404.19737, 2024.
-[^3]: Ofir Press and Noah A. Smith and Mike Lewis. [Train Short, Test Long: Attention with Linear Biases Enables Input Length Extrapolation](https://arxiv.org/abs/2108.12409) arXiv preprint arXiv:2108.12409, 2022.
-[^4]: Noam Shazeer. [GLU Variants Improve Transformer](https://arxiv.org/abs/2002.05202) arXiv preprint arXiv:2002.05202, 2020.
-[^5]: Nikhil Vyas and Depen Morwani and Rosie Zhao and Itai Shapira and David Brandfonbrener and Lucas Janson and Sham Kakade. [SOAP: Improving and Stabilizing Shampoo using Adam](https://arxiv.org/abs/2409.11321) arXiv preprint arXiv:2409.11321, 2024.
-[^6]: Kevin Slagle. [SpaceByte: Towards Deleting Tokenization from Large Language Modeling](https://arxiv.org/abs/2404.14408) arXiv preprint arXiv:2404.14408, 2024.
+_The_ _bee_ nodded_ and sa_id,_ _"Yes,_ I_ _would_ love_ to_ jo_in_ me,_ too!_"
+```
+
+The `_` prefixes the bytes where the model decided to insert the intermediate transformer blocks.
+As we can see, this somehow looks it a form of tokenization.
+
+When completly disabling the intermediate transformer blocks, the model can still generate well-formed words, but loose coherence at the sentence level:
+
+```
+Once upon a time in the wet borided in the safe in all the wonderful and thought again. He smilly came of the brave enough to listen that missides! He said whines waved as she funny thanks the weak down that is all the bricycle.
+```
+
+This suggests that the intermediate blocks may produces "higher-level" representations that helps the model to maintain coherence over longer ranges.
+
+## Usage
+
+```bash
+# Installation
+uv sync
+
+# Initialize a new model
+python picolm.py init models/my-model --dim 372 --latent-num-blocks 8 --fb-att-window-size 32
+
+# Train the model
+python picolm.py train models/my-model my-train-run roneneldan/TinyStories --dataset-column-name text --batch-size 8
+
+# Generate text
+python picolm.py run models/my-model my-train-run --temperature 0.8 --prompt "Once upon a time"
+```
