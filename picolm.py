@@ -233,6 +233,7 @@ def train_command(
     batch_size: int | None = None,
     learning_rate: float | None = None,
     weight_decay: float | None = None,
+    epochs: int | None = None,
     max_steps: int | None = None,
     warmup_steps: int | None = None,
     grad_accumulation_steps: int | None = None,
@@ -264,6 +265,7 @@ def train_command(
         batch_size=batch_size,
         learning_rate=learning_rate,
         weight_decay=weight_decay,
+        epochs=epochs,
         max_steps=max_steps,
         warmup_steps=warmup_steps,
         grad_accumulation_steps=grad_accumulation_steps,
@@ -313,7 +315,7 @@ def train_command(
         ) / 1000
 
         logger.info(
-            f"[{step.i}]\t lm: {step.train.next_token_lm_loss:.4f} ({step.train.bits_per_byte:.2f} bpB, pplx: {step.train.perplexity:.2f}), aux: {step.train.aux_loss:.4f}\t ({kb_per_sec:.0f} kB/s)"
+            f"[{step.epoch} - {step.i}]\t lm: {step.train.next_token_lm_loss:.4f} ({step.train.bits_per_byte:.2f} bpB, pplx: {step.train.perplexity:.2f}), aux: {step.train.aux_loss:.4f}\t ({kb_per_sec:.0f} kB/s)"
         )
 
         if step.i % 500 == 0:

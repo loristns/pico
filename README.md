@@ -1,6 +1,6 @@
 # 🤏Pico
 
-Pico is my experimental decoder-only architecture designed to bypass tokenization by processing raw bytes directly.
+Pico is my experimental language model decoder-only architecture designed to bypass tokenization by processing raw bytes directly.
 
 ![Pico architecture](assets/architecture.svg)
 
