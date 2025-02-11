@@ -27,7 +27,7 @@ _The_ _bee_ nodded_ and sa_id,_ _"Yes,_ I_ _would_ love_ to_ jo_in_ me,_ too!_"
 ```
 
 The `_` prefixes the bytes where the model decided to insert the intermediate transformer blocks.
-As we can see, this somehow looks it a form of tokenization.
+As we can see, the model has somehow chosen to insert them at word boundaries like a form of "tokenization".
 
 When completly disabling the intermediate transformer blocks, the model can still generate well-formed words, but loose coherence at the sentence level:
 
@@ -36,6 +36,8 @@ Once upon a time in the wet borided in the safe in all the wonderful and thought
 ```
 
 This suggests that the intermediate blocks may produces "higher-level" representations that helps the model to maintain coherence over longer ranges.
+
+That being said, I also observed harder-to-interpret patterns on models trained on other datasets, so it's not clear that the Mixture-of-Depths is systematically used by the model as a form of tokenization.
 
 ## Usage
 

@@ -308,7 +308,8 @@ def train(
 
                 validation_metrics = None
                 if (
-                    validation_dataloader is not None
+                    accelerator.is_main_process
+                    and validation_dataloader is not None
                     and step % training_meta.validation_interval == 0
                     and step > 0
                 ):
@@ -328,9 +329,12 @@ def train(
                 )
 
                 accelerator.log(training_step.model_dump(exclude=["i", "epoch"]), step=step)
-                yield training_step
+                if accelerator.is_main_process:
+                    yield training_step
 
                 accelerator.backward(loss)
+                if accelerator.sync_gradients:
+                    accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
                 # Update learning rate according to schedule before next optimizer step
                 lr = lr_schedule(step, training_meta)

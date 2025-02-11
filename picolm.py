@@ -301,6 +301,8 @@ def train_command(
 
     # Train loop
     tm1 = time.time()
+    step: TrainingStep | None = None
+
     for step in train(
         model,
         train_dataset,
@@ -328,7 +330,7 @@ def train_command(
         tm1 = time.time()
 
     # Save last step
-    if step.i not in [s.i for s in training_logs.checkpoints]:
+    if step and step.i not in [s.i for s in training_logs.checkpoints]:
         save(model, run_directory / f"{step.i:08d}.safetensors")
         training_logs.checkpoints.append(step)
         training_logs_file.write_text(training_logs.model_dump_json(indent=2))
