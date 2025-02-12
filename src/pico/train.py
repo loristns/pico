@@ -235,6 +235,7 @@ def train(
     validation_dataset: Dataset | IterableDataset | None = None,
     training_meta: TrainingMeta = DEFAULT_TRAINING_META,
     tracker_project_name: str | None = None,
+    tracker_run_name: str | None = None,
 ):
     # Configure training
     accelerator = Accelerator(
@@ -246,7 +247,13 @@ def train(
 
     if tracker_project_name is not None:
         accelerator.init_trackers(
-            tracker_project_name, config=training_meta.model_dump()
+            tracker_project_name,
+            config=training_meta.model_dump(),
+            init_kwargs={
+                "wandb": {
+                    "name": tracker_run_name,
+                }
+            },
         )
 
     model.train()

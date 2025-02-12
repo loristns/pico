@@ -3,6 +3,7 @@ import logging
 import pathlib
 import time
 from typing import Annotated
+import random
 
 import torch
 import typer
@@ -309,6 +310,7 @@ def train_command(
         validation_dataset=validation_dataset,
         training_meta=training_meta,
         tracker_project_name=tracker_project_name or path.name,
+        tracker_run_name=f'{run_name}-{random.randint(0, 999)}',
     ):
         tm2 = time.time()
 
