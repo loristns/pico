@@ -1,13 +1,12 @@
 import json
 import pathlib
-from typing import Optional
 
 from safetensors.torch import safe_open, save_file
 
 from .model import Pico, PicoMeta
 
 
-def save(model: Pico, file: pathlib.Path, metadata_file: Optional[pathlib.Path] = None):
+def save(model: Pico, file: pathlib.Path, metadata_file: pathlib.Path | None = None):
     save_file(
         model._orig_mod.state_dict()
         if hasattr(model, "_orig_mod")

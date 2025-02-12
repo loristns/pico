@@ -1,5 +1,5 @@
 import math
-from typing import Dict, Optional, Union
+from typing import Literal
 
 import einops
 import torch
@@ -67,59 +67,57 @@ class TrainingStep(BaseModel):
     i: int
     epoch: int
     train: TrainingStepMetrics
-    validation: Optional[TrainingStepMetrics] = None
+    validation: TrainingStepMetrics | None = None
 
 
 def format_dataset(
-    dataset: Union[Dataset, IterableDataset],
+    dataset: Dataset | IterableDataset,
     pico_meta: PicoMeta,
     training_meta: TrainingMeta,
 ):
-    def _preprocess(batch: Dict[str, list[bytes]]):
-        START_SEQ = list(b"<pico:seq>")
-        END_SEQ = list(b"</pico:seq>")
+    start_seq = torch.tensor(bytearray(b"<pico:seq>"), dtype=torch.uint8)
+    end_seq = torch.tensor(bytearray(b"</pico:seq>"), dtype=torch.uint8)
+    chunk_window_len = training_meta.context_len + pico_meta.next_tokens
 
-        chunks = []
-        current_buffer = []
+    def _preprocess(batch: dict[Literal["bytes"], list[bytes]]):
+        token_list = []
 
-        window_len = training_meta.context_len + pico_meta.next_tokens
+        for doc in batch["bytes"]:
+            doc_tensor = torch.tensor(bytearray(doc), dtype=torch.uint8)
+            token_list.extend([start_seq, doc_tensor, end_seq])
 
-        doc_separation_seq_len = len(START_SEQ) + len(END_SEQ)
+        tokens = torch.cat(token_list)
 
-        for bytes in batch["bytes"]:
-            current_buffer.extend(START_SEQ)
-            current_buffer.extend(bytes)
+        # Determine the number of full chunks we can form.
+        n_chunks = tokens.shape[0] // chunk_window_len
+        if n_chunks == 0:
+            # Not enough tokens for a full chunk -> return empty tensors.
+            return {
+                "x": torch.empty(0, dtype=torch.long),
+                "y": torch.empty(0, dtype=torch.long),
+            }
 
-            # Split the buffer into chunks of window_len
-            while len(current_buffer) >= window_len:
-                chunk = current_buffer[:window_len]
-                chunks.append(chunk)
-                current_buffer = current_buffer[window_len:]
+        # Only use the tokens that form complete chunks.
+        tokens = tokens[: n_chunks * chunk_window_len]
 
-            # Handle the edge case where appending the end sequence + start sequence would exceed the window length
-            while len(current_buffer) + doc_separation_seq_len > window_len:
-                # Drop prefix
-                current_buffer = current_buffer[doc_separation_seq_len - 1 :]
+        # Create chunks
+        # [n_chunks, chunk_window_len]
+        chunks = tokens.to(torch.long).view(n_chunks, chunk_window_len)
 
-            current_buffer.extend(END_SEQ)
+        # Unfold to create next_tokens sliding windows
+        # [n_chunks, next_tokens + 1, context_len]
+        chunks = chunks.unfold(dimension=1, size=training_meta.context_len, step=1)
 
-        chunks = torch.tensor(chunks).unfold(1, training_meta.context_len, 1)
         chunks = einops.rearrange(
-            chunks, "batch next_tokens seq_len -> batch seq_len next_tokens"
+            chunks, "batch next_tokens context_len -> batch context_len next_tokens"
         )
 
-        results = {
-            "x": chunks[:, :, 0],
-            "y": chunks[:, :, 1:],
-        }
+        # For each sliding window, use the first token as input (x) and the rest as targets (y)
+        x = chunks[:, :, 0]
+        y = chunks[:, :, 1:]
+        return {"x": x, "y": y}
 
-        return results
-
-    return (
-        dataset.shuffle()
-        .map(_preprocess, batched=True, remove_columns=["bytes"])
-        .with_format("numpy")
-    )
+    return dataset.shuffle().map(_preprocess, batched=True, remove_columns=["bytes"])
 
 
 def lr_schedule(step: int, training_meta: TrainingMeta):
@@ -233,10 +231,10 @@ def get_validation_metrics(
 
 def train(
     model: Pico,
-    dataset: Union[Dataset, IterableDataset],
-    validation_dataset: Optional[Union[Dataset, IterableDataset]] = None,
+    dataset: Dataset | IterableDataset,
+    validation_dataset: Dataset | IterableDataset | None = None,
     training_meta: TrainingMeta = DEFAULT_TRAINING_META,
-    tracker_project_name: Optional[str] = None,
+    tracker_project_name: str | None = None,
 ):
     # Configure training
     accelerator = Accelerator(
@@ -258,6 +256,7 @@ def train(
         format_dataset(dataset, model.metadata, training_meta),
         batch_size=training_meta.batch_size,
         pin_memory=True,
+        num_workers=dataset.num_shards,
     )
 
     validation_dataloader = None
@@ -266,6 +265,7 @@ def train(
             format_dataset(validation_dataset, model.metadata, training_meta),
             batch_size=training_meta.batch_size,
             pin_memory=True,
+            num_workers=validation_dataset.num_shards,
         )
 
     trainable_params = {
@@ -328,7 +328,9 @@ def train(
                     validation=validation_metrics,
                 )
 
-                accelerator.log(training_step.model_dump(exclude=["i", "epoch"]), step=step)
+                accelerator.log(
+                    training_step.model_dump(exclude=["i", "epoch"]), step=step
+                )
                 if accelerator.is_main_process:
                     yield training_step
 

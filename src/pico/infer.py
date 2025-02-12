@@ -1,5 +1,3 @@
-from typing import Optional
-
 import torch
 from pydantic import BaseModel
 from torch.nn import functional as F
@@ -21,7 +19,7 @@ class InferenceStep(BaseModel):
 
 def infer(
     model: Pico,
-    prompt: Optional[bytes] = None,
+    prompt: bytes | None = None,
     temperature: float = 1.0,
     max_iteration: int = -1,
     stop_end_seq: bool = True,
