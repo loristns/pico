@@ -3,9 +3,10 @@ from typing import Literal
 
 import einops
 import torch
-from accelerate import Accelerator
 from datasets import Dataset, IterableDataset
 from pydantic import BaseModel, computed_field
+from torch.amp import GradScaler
+from torch.nn import DataParallel
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
@@ -206,7 +207,8 @@ def get_validation_metrics(
         x = data["x"].to(device)
         y = data["y"].to(device)
 
-        pred, router_weights, router_decisions, _ = model(x)
+        with torch.autocast(device.type, dtype=torch.bfloat16):
+            pred, router_weights, router_decisions, _ = model(x)
 
         loss, aux_loss, next_token_lm_loss = loss_fn(
             pred, router_weights, router_decisions, y
@@ -234,31 +236,7 @@ def train(
     dataset: Dataset | IterableDataset,
     validation_dataset: Dataset | IterableDataset | None = None,
     training_meta: TrainingMeta = DEFAULT_TRAINING_META,
-    tracker_project_name: str | None = None,
-    tracker_run_name: str | None = None,
 ):
-    # Configure training
-    accelerator = Accelerator(
-        mixed_precision="bf16",
-        gradient_accumulation_steps=training_meta.grad_accumulation_steps,
-        log_with="all",
-    )
-    device = accelerator.device
-
-    if tracker_project_name is not None:
-        accelerator.init_trackers(
-            tracker_project_name,
-            config=training_meta.model_dump(),
-            init_kwargs={
-                "wandb": {
-                    "name": tracker_run_name,
-                }
-            },
-        )
-
-    model.train()
-    model.to(device)
-
     dataloader = DataLoader(
         format_dataset(dataset, model.metadata, training_meta),
         batch_size=training_meta.batch_size,
@@ -274,6 +252,11 @@ def train(
             pin_memory=True,
             num_workers=validation_dataset.num_shards,
         )
+
+    device = torch.device("cuda")
+    model = DataParallel(model)
+    model = model.to(device)
+    model.train()
 
     trainable_params = {
         name: param for name, param in model.named_parameters() if param.requires_grad
@@ -298,60 +281,55 @@ def train(
         lr=training_meta.learning_rate,
     )
 
-    model, optimizer, dataloader = accelerator.prepare(model, optimizer, dataloader)
+    scaler = GradScaler()
 
     # Training loop
     step = 0
     for epoch in range(training_meta.epochs):
         for data in dataloader:
-            with accelerator.accumulate(model):
-                x = data["x"]
-                y = data["y"]
+            x = data["x"].to(device)
+            y = data["y"].to(device)
+
+            with torch.autocast(device.type, dtype=torch.bfloat16):
                 pred, router_weights, router_decisions, _ = model(x)
 
-                loss, aux_loss, next_token_lm_loss = loss_fn(
-                    pred, router_weights, router_decisions, y
+            loss, aux_loss, next_token_lm_loss = loss_fn(
+                pred, router_weights, router_decisions, y
+            )
+
+            validation_metrics = None
+            if (
+                validation_dataloader is not None
+                and step % training_meta.validation_interval == 0
+                and step > 0
+            ):
+                validation_metrics = get_validation_metrics(
+                    model, validation_dataloader, device=device
                 )
 
-                validation_metrics = None
-                if (
-                    accelerator.is_main_process
-                    and validation_dataloader is not None
-                    and step % training_meta.validation_interval == 0
-                    and step > 0
-                ):
-                    validation_metrics = get_validation_metrics(
-                        model, validation_dataloader, device
-                    )
+            training_step = TrainingStep(
+                i=step,
+                epoch=epoch,
+                train=TrainingStepMetrics(
+                    loss=loss.item(),
+                    next_token_lm_loss=next_token_lm_loss.item(),
+                    aux_loss=aux_loss.item(),
+                ),
+                validation=validation_metrics,
+            )
 
-                training_step = TrainingStep(
-                    i=step,
-                    epoch=epoch,
-                    train=TrainingStepMetrics(
-                        loss=loss.item(),
-                        next_token_lm_loss=next_token_lm_loss.item(),
-                        aux_loss=aux_loss.item(),
-                    ),
-                    validation=validation_metrics,
-                )
+            yield training_step
 
-                accelerator.log(
-                    training_step.model_dump(exclude=["i", "epoch"]), step=step
-                )
-                if accelerator.is_main_process:
-                    yield training_step
+            scaler.scale(loss).backward()
 
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
+            if (step + 1) % training_meta.grad_accumulation_steps == 0:
                 # Update learning rate according to schedule before next optimizer step
                 lr = lr_schedule(step, training_meta)
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr
 
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
                 optimizer.zero_grad()
-                step += 1
 
-    accelerator.end_training()
+            step += 1

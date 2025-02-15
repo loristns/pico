@@ -1,12 +1,13 @@
 import codecs
 import logging
 import pathlib
+import random
 import time
 from typing import Annotated
-import random
 
 import torch
 import typer
+import wandb
 from datasets import IterableDataset, IterableDatasetDict, load_dataset
 from pydantic import BaseModel
 from rich.console import Console
@@ -291,6 +292,12 @@ def train_command(
     training_logs_file = run_directory / "training.json"
     training_logs_file.write_text(training_logs.model_dump_json(indent=2))
 
+    wandb_run = wandb.init(
+        project=tracker_project_name or path.name,
+        name=f"{run_name}-{''.join(random.choice('abcdefghijklmnopqrstuvwxyz') for _ in range(3))}",
+        config=training_meta.model_dump(),
+    )
+
     # Load model
     if base_weights is None:
         model = Pico(load_metadata(path / "model.json"))
@@ -299,6 +306,7 @@ def train_command(
         model = load(base_weights, metadata_file)
 
     model = torch.compile(model)
+    logger.debug("Model compiled")
 
     # Train loop
     tm1 = time.time()
@@ -309,8 +317,6 @@ def train_command(
         train_dataset,
         validation_dataset=validation_dataset,
         training_meta=training_meta,
-        tracker_project_name=tracker_project_name or path.name,
-        tracker_run_name=f'{run_name}-{random.randint(0, 999)}',
     ):
         tm2 = time.time()
 
@@ -321,6 +327,7 @@ def train_command(
         logger.info(
             f"[{step.epoch} - {step.i}]\t lm: {step.train.next_token_lm_loss:.4f} ({step.train.bits_per_byte:.2f} bpB, pplx: {step.train.perplexity:.2f}), aux: {step.train.aux_loss:.4f}\t ({kb_per_sec:.0f} kB/s)"
         )
+        wandb_run.log(step.model_dump(exclude=["epoch", "i"]))
 
         if step.i % 500 == 0:
             logger.info(f"Saving checkpoint at step: {step.i}")
