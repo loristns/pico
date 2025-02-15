@@ -4,9 +4,8 @@ from typing import Literal
 import einops
 import torch
 from datasets import Dataset, IterableDataset
+from lightning.fabric import Fabric
 from pydantic import BaseModel, computed_field
-from torch.amp import GradScaler
-from torch.nn import DataParallel
 from torch.nn import functional as F
 from torch.utils.data import DataLoader
 
@@ -196,7 +195,6 @@ def loss_fn(
 def get_validation_metrics(
     model: Pico,
     dataloader: DataLoader,
-    device: torch.device,
 ) -> TrainingStepMetrics:
     total_loss = 0.0
     total_aux_loss = 0.0
@@ -204,10 +202,10 @@ def get_validation_metrics(
     num_steps = 0
 
     for data in dataloader:
-        x = data["x"].to(device)
-        y = data["y"].to(device)
+        x = data["x"]
+        y = data["y"]
 
-        with torch.autocast(device.type, dtype=torch.bfloat16):
+        with torch.autocast("cuda", dtype=torch.bfloat16):
             pred, router_weights, router_decisions, _ = model(x)
 
         loss, aux_loss, next_token_lm_loss = loss_fn(
@@ -236,7 +234,12 @@ def train(
     dataset: Dataset | IterableDataset,
     validation_dataset: Dataset | IterableDataset | None = None,
     training_meta: TrainingMeta = DEFAULT_TRAINING_META,
+    devices: int = 1,
 ):
+    fabric = Fabric(accelerator="cuda", devices=devices, strategy="fsdp", precision="bf16-mixed")
+    torch._dynamo.config.optimize_ddp = False
+    fabric.launch()
+
     dataloader = DataLoader(
         format_dataset(dataset, model.metadata, training_meta),
         batch_size=training_meta.batch_size,
@@ -252,11 +255,6 @@ def train(
             pin_memory=True,
             num_workers=validation_dataset.num_shards,
         )
-
-    device = torch.device("cuda")
-    model = DataParallel(model)
-    model = model.to(device)
-    model.train()
 
     trainable_params = {
         name: param for name, param in model.named_parameters() if param.requires_grad
@@ -281,17 +279,20 @@ def train(
         lr=training_meta.learning_rate,
     )
 
-    scaler = GradScaler()
+    model, optimizer = fabric.setup(model, optimizer)
+    dataloader, validation_dataloader = fabric.setup_dataloaders(
+        dataloader, validation_dataloader
+    )
+    model.train()
 
     # Training loop
     step = 0
     for epoch in range(training_meta.epochs):
         for data in dataloader:
-            x = data["x"].to(device)
-            y = data["y"].to(device)
+            x = data["x"]
+            y = data["y"]
 
-            with torch.autocast(device.type, dtype=torch.bfloat16):
-                pred, router_weights, router_decisions, _ = model(x)
+            pred, router_weights, router_decisions, _ = model(x)
 
             loss, aux_loss, next_token_lm_loss = loss_fn(
                 pred, router_weights, router_decisions, y
@@ -304,7 +305,7 @@ def train(
                 and step > 0
             ):
                 validation_metrics = get_validation_metrics(
-                    model, validation_dataloader, device=device
+                    model, validation_dataloader
                 )
 
             training_step = TrainingStep(
@@ -320,7 +321,7 @@ def train(
 
             yield training_step
 
-            scaler.scale(loss).backward()
+            fabric.backward(loss)
 
             if (step + 1) % training_meta.grad_accumulation_steps == 0:
                 # Update learning rate according to schedule before next optimizer step
@@ -328,8 +329,7 @@ def train(
                 for param_group in optimizer.param_groups:
                     param_group["lr"] = lr
 
-                scaler.step(optimizer)
-                scaler.update()
+                optimizer.step()
                 optimizer.zero_grad()
 
             step += 1

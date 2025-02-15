@@ -199,6 +199,10 @@ def train_command(
         str,
         typer.Argument(help="HuggingFace dataset path"),
     ],
+    devices: Annotated[
+        int,
+        typer.Option(help="Number of devices to use for training"),
+    ] = torch.cuda.device_count(),
     dataset_column_name: Annotated[
         str,
         typer.Option(help="Name of the column in the dataset to use for training."),
@@ -306,7 +310,6 @@ def train_command(
         model = load(base_weights, metadata_file)
 
     model = torch.compile(model)
-    logger.debug("Model compiled")
 
     # Train loop
     tm1 = time.time()
@@ -317,6 +320,7 @@ def train_command(
         train_dataset,
         validation_dataset=validation_dataset,
         training_meta=training_meta,
+        devices=devices,
     ):
         tm2 = time.time()
 
