@@ -234,7 +234,7 @@ def train(
     dataset: Dataset | IterableDataset,
     validation_dataset: Dataset | IterableDataset | None = None,
     training_meta: TrainingMeta = DEFAULT_TRAINING_META,
-    devices: int = 1,
+    devices: int = torch.cuda.device_count(),
 ):
     fabric = Fabric(accelerator="cuda", devices=devices, strategy="fsdp", precision="bf16-mixed")
     torch._dynamo.config.optimize_ddp = False
@@ -300,7 +300,8 @@ def train(
 
             validation_metrics = None
             if (
-                validation_dataloader is not None
+                fabric.global_rank == 0
+                and validation_dataloader is not None
                 and step % training_meta.validation_interval == 0
                 and step > 0
             ):
@@ -319,7 +320,8 @@ def train(
                 validation=validation_metrics,
             )
 
-            yield training_step
+            if fabric.global_rank == 0:
+                yield training_step
 
             fabric.backward(loss)
 
