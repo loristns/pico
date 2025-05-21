@@ -1,4 +1,5 @@
 import math
+import pathlib
 from typing import Literal
 
 import einops
@@ -231,29 +232,47 @@ def get_validation_metrics(
 
 def train(
     model: Pico,
+    fabric: Fabric,
     dataset: Dataset | IterableDataset,
     validation_dataset: Dataset | IterableDataset | None = None,
     training_meta: TrainingMeta = DEFAULT_TRAINING_META,
-    devices: int = torch.cuda.device_count(),
+    base_weights_path: pathlib.Path | None = None,
+    test_run: bool = False, # New parameter
 ):
-    fabric = Fabric(accelerator="cuda", devices=devices, strategy="fsdp", precision="bf16-mixed")
-    torch._dynamo.config.optimize_ddp = False
-    fabric.launch()
+    if test_run:
+        # For test runs, especially on CPU, num_workers=0 can be more stable/faster.
+        # For GPU test runs, 1 might be fine.
+        loader_num_workers = 0 if fabric.accelerator == "cpu" else 1
+        fabric.print(f"Test run: Setting DataLoader num_workers to {loader_num_workers}")
+    else:
+        # Existing logic, ensure dataset has num_shards or provide a default.
+        # The IterableDataset from HuggingFace usually has num_shards.
+        loader_num_workers = dataset.num_shards if hasattr(dataset, "num_shards") and dataset.num_shards > 0 else 1
+        if not hasattr(dataset, "num_shards") or dataset.num_shards <= 0 :
+            fabric.print(f"Warning: dataset.num_shards not available or invalid. Defaulting num_workers to 1.")
 
     dataloader = DataLoader(
         format_dataset(dataset, model.metadata, training_meta),
         batch_size=training_meta.batch_size,
-        pin_memory=True,
-        num_workers=dataset.num_shards,
+        pin_memory=True, # pin_memory is fine for CPU if memory allows, no major harm.
+        num_workers=loader_num_workers,
     )
 
     validation_dataloader = None
     if validation_dataset is not None:
+        # Apply similar logic for validation_dataloader num_workers
+        if test_run:
+            val_loader_num_workers = 0 if fabric.accelerator == "cpu" else 1
+        else:
+            val_loader_num_workers = validation_dataset.num_shards if hasattr(validation_dataset, "num_shards") and validation_dataset.num_shards > 0 else 1
+            if not hasattr(validation_dataset, "num_shards") or validation_dataset.num_shards <= 0:
+                 fabric.print(f"Warning: validation_dataset.num_shards not available or invalid. Defaulting num_workers for validation to 1.")
+
         validation_dataloader = DataLoader(
             format_dataset(validation_dataset, model.metadata, training_meta),
             batch_size=training_meta.batch_size,
             pin_memory=True,
-            num_workers=validation_dataset.num_shards,
+            num_workers=val_loader_num_workers,
         )
 
     trainable_params = {
@@ -283,6 +302,12 @@ def train(
     dataloader, validation_dataloader = fabric.setup_dataloaders(
         dataloader, validation_dataloader
     )
+
+    if base_weights_path:
+        fabric.print(f"Loading base weights from {base_weights_path}")
+        states_to_load = {"model": model}
+        fabric.load(base_weights_path, states_to_load)
+
     model.train()
 
     # Training loop
