@@ -8,14 +8,16 @@ from typing import Annotated
 import torch
 import typer
 import wandb
-from datasets import IterableDataset, IterableDatasetDict, load_dataset
+from lightning.fabric import Fabric
+from lightning.fabric.strategies import FSDPStrategy
+from datasets import IterableDataset, IterableDatasetDict, load_dataset # IterableDataset already here
 from pydantic import BaseModel
 from rich.console import Console
 from rich.logging import RichHandler
 
 from pico.infer import infer
 from pico.model import PICO_XS_PRESET, Pico
-from pico.serialization import load, load_metadata, save
+from pico.serialization import load, load_metadata
 from pico.train import DEFAULT_TRAINING_META, TrainingMeta, TrainingStep, train
 
 console = Console()
@@ -199,6 +201,10 @@ def train_command(
         str,
         typer.Argument(help="HuggingFace dataset path"),
     ],
+    devices: Annotated[
+        int,
+        typer.Option(help="Number of devices to use for training"),
+    ] = torch.cuda.device_count(),
     dataset_column_name: Annotated[
         str,
         typer.Option(help="Name of the column in the dataset to use for training."),
@@ -240,26 +246,16 @@ def train_command(
     warmup_steps: int | None = None,
     grad_accumulation_steps: int | None = None,
     validation_interval: int | None = None,
+    test_run: Annotated[
+        bool,
+        typer.Option(help="Enable a quick test run with a minimal dataset and config."),
+    ] = False,
 ):
     if not path.is_dir() or not (path / "model.json").exists():
         logger.error(f"Invalid model directory: {path}")
         raise typer.Exit(code=1)
 
-    # Load datasets
-    train_dataset, validation_dataset = _load_dataset(
-        dataset_path,
-        dataset_train_file,
-        dataset_validation_file,
-        dataset_train_split,
-        dataset_validation_split,
-        dataset_validation_size,
-    )
-
-    # Prepare datasets
-    train_dataset = _prepare_dataset(train_dataset, dataset_column_name, shuffle=True)
-    validation_dataset = _prepare_dataset(validation_dataset, dataset_column_name)
-
-    # Init training metadata
+    # Init training metadata - moved up to be potentially overridden by test_run
     training_meta = DEFAULT_TRAINING_META.model_copy()
     _update_if_set(
         training_meta,
@@ -290,23 +286,95 @@ def train_command(
         tracker_project_name=tracker_project_name or path.name,
     )
     training_logs_file = run_directory / "training.json"
+    # training_logs_file.write_text(training_logs.model_dump_json(indent=2)) # Moved down after potential meta override
+
+    if test_run:
+        logger.info("--- TEST RUN ENABLED ---")
+        logger.info("Overriding dataset to a minimal in-memory dataset.")
+        dummy_data = [
+            {"bytes": b"This is a short test sentence."},
+            {"bytes": b"Another piece of text for testing."},
+            {"bytes": b"Pico is learning, byte by byte."},
+            {"bytes": b"A final entry in our tiny dataset."},
+        ]
+        train_dataset = IterableDataset.from_iterable(dummy_data[:3])
+        validation_dataset = IterableDataset.from_iterable(dummy_data[3:])
+        
+        # Mock num_shards attribute if needed by DataLoader setup in train function
+        # This is a simple way to ensure format_dataset in train.py doesn't break
+        # if it expects num_shards for DataLoader(num_workers=...)
+        train_dataset.num_shards = 1 
+        validation_dataset.num_shards = 1
+        
+        logger.info(f"Using {len(dummy_data)} dummy samples for test run.")
+
+        logger.info("Overriding training metadata for a minimal test run.")
+        training_meta.max_steps = 2
+        training_meta.batch_size = 1
+        training_meta.context_len = 32
+        training_meta.warmup_steps = 1
+        training_meta.validation_interval = 2 
+        training_meta.epochs = 1
+        training_meta.grad_accumulation_steps = 1
+        
+        wandb_run = wandb.init(mode="disabled")
+        logger.info("W&B tracking disabled for test run.")
+    else:
+        # Load datasets
+        train_dataset, validation_dataset = _load_dataset(
+            dataset_path,
+            dataset_train_file,
+            dataset_validation_file,
+            dataset_train_split,
+            dataset_validation_split,
+            dataset_validation_size,
+        )
+
+        # Prepare datasets
+        train_dataset = _prepare_dataset(train_dataset, dataset_column_name, shuffle=True)
+        validation_dataset = _prepare_dataset(validation_dataset, dataset_column_name)
+        
+        wandb_run = wandb.init(
+            project=tracker_project_name or path.name,
+            name=f"{run_name}-{''.join(random.choice('abcdefghijklmnopqrstuvwxyz') for _ in range(3))}",
+            config=training_meta.model_dump(),
+        )
+
+    # Write training logs *after* potential override by test_run
     training_logs_file.write_text(training_logs.model_dump_json(indent=2))
 
-    wandb_run = wandb.init(
-        project=tracker_project_name or path.name,
-        name=f"{run_name}-{''.join(random.choice('abcdefghijklmnopqrstuvwxyz') for _ in range(3))}",
-        config=training_meta.model_dump(),
-    )
-
     # Load model
-    if base_weights is None:
-        model = Pico(load_metadata(path / "model.json"))
-    else:
-        metadata_file = base_weights.parent.parent / "model.json"
-        model = load(base_weights, metadata_file)
+    # Always initialize a new model instance
+    model_meta = load_metadata(path / "model.json")
+    model = Pico(model_meta)
 
     model = torch.compile(model)
-    logger.debug("Model compiled")
+
+    # Initialize Fabric based on devices
+    if devices == 0:
+        accelerator = "cpu"
+        num_fabric_devices = 1
+        strategy_fabric = "auto"
+        precision_fabric = None
+    elif devices == 1:
+        accelerator = "cuda"
+        num_fabric_devices = 1
+        strategy_fabric = "auto"
+        precision_fabric = "bf16-mixed"
+    else:  # devices > 1
+        accelerator = "cuda"
+        num_fabric_devices = devices
+        strategy_fabric = FSDPStrategy(state_dict_type="full")
+        precision_fabric = "bf16-mixed"
+        torch._dynamo.config.optimize_ddp = False
+
+    fabric = Fabric(
+        accelerator=accelerator,
+        devices=num_fabric_devices,
+        strategy=strategy_fabric,
+        precision=precision_fabric,
+    )
+    fabric.launch()
 
     # Train loop
     tm1 = time.time()
@@ -314,9 +382,13 @@ def train_command(
 
     for step in train(
         model,
+        fabric,
         train_dataset,
         validation_dataset=validation_dataset,
         training_meta=training_meta,
+        devices=devices,  # This argument is no longer used by pico.train.train but is kept for compatibility with fabric init
+        base_weights_path=base_weights,
+        test_run=test_run,
     ):
         tm2 = time.time()
 
@@ -332,7 +404,8 @@ def train_command(
         if step.i % 500 == 0:
             logger.info(f"Saving checkpoint at step: {step.i}")
 
-            save(model, run_directory / f"{step.i:08d}.safetensors")
+            checkpoint_path = run_directory / f"{step.i:08d}.safetensors"
+            fabric.save(checkpoint_path, {"model": model})
             training_logs.checkpoints.append(step)
             training_logs_file.write_text(training_logs.model_dump_json(indent=2))
 
@@ -340,7 +413,8 @@ def train_command(
 
     # Save last step
     if step and step.i not in [s.i for s in training_logs.checkpoints]:
-        save(model, run_directory / f"{step.i:08d}.safetensors")
+        checkpoint_path = run_directory / f"{step.i:08d}.safetensors"
+        fabric.save(checkpoint_path, {"model": model})
         training_logs.checkpoints.append(step)
         training_logs_file.write_text(training_logs.model_dump_json(indent=2))
 
